@@ -51,6 +51,8 @@ number or a false "Resolved"/"Open" status.
 import re
 from datetime import date, datetime
 
+from text_summarizer import shorten, split_on_arrow
+
 TITLE_RE = re.compile(r"DAY\s+BOOK\s+SUMMARY", re.IGNORECASE)
 
 # Same non-ASCII-only decoration tolerance as the Monitoring parser (emoji
@@ -158,14 +160,37 @@ def _block_lines(block: str) -> list:
     return items
 
 
-def _extract_amount(text: str) -> str:
+# "Crore"/"Lakh" (and common abbreviations) immediately after a matched
+# figure are unambiguous, fixed Indian numeral multipliers - e.g. "₹1.36
+# Crore" means 1.36 * 1,00,00,000, not literally 1.36 - so unlike
+# everything else in this module, expanding them isn't "inventing" a
+# value, it's reading the number correctly.
+_UNIT_MULTIPLIER_RE = re.compile(r"^(crore|cr\.?|lakhs?|lacs?|lk)\b", re.IGNORECASE)
+_CRORE = 10_000_000
+_LAKH = 100_000
+
+
+def _extract_amount_number(text: str):
+    """Finds the first currency-marked figure in `text` and returns it as
+    a bare int/float - no ₹ symbol, no comma grouping (e.g. "₹16,06,711"
+    -> 1606711) - so the sheet stores a real number a Dashboard can sum
+    or filter, per "Amount is a bare integer, not a formatted currency
+    string". Returns "" (never a fabricated 0) when no amount is found.
+    """
     match = _AMOUNT_RE.search(text)
     if not match:
         return ""
-    # [\d,]* can end on a trailing comma (e.g. "₹1,05,000," when a comma
-    # in the source text immediately follows the figure) - trim it so the
-    # stored amount is exactly the number, not a formatting artifact.
-    return match.group(0).strip().rstrip(",")
+    digits = re.sub(r"[^\d.]", "", match.group(0)).rstrip(".")
+    if not digits:
+        return ""
+    value = float(digits) if "." in digits else int(digits)
+
+    unit_match = _UNIT_MULTIPLIER_RE.match(text[match.end():].strip())
+    if unit_match:
+        value = round(value * (_CRORE if unit_match.group(1).lower().startswith("cr") else _LAKH), 2)
+        if isinstance(value, float) and value.is_integer():
+            value = int(value)
+    return value
 
 
 # --- Priority / Status classification -----------------------------------
@@ -227,6 +252,30 @@ def _looks_like_entity(text: str) -> bool:
     return True
 
 
+# Fallback for entity names with no separator right after them at all
+# (e.g. "Micronova Impex purchase invoice was inflated...") - a short run
+# of 2-5 Capitalized Words at the very start of the text, followed by a
+# lowercase word, is treated as a leading entity name. Tried only when
+# the separator-based method above finds nothing, so a normal capitalized
+# sentence opener never gets mistaken for an entity. Requires AT LEAST 2
+# capitalized words (not 1) - a single leading capital is just how every
+# English sentence starts (e.g. "Major invoice cancelled..." or "New
+# vendor Industech..." must NOT yield entity "Major"/"New") and is far
+# too weak a signal on its own; a real multi-word name is much less
+# likely to be a coincidence.
+_LEADING_ENTITY_WORDS_RE = re.compile(r"^([A-Z][\w&.]*(?:\s+[A-Z][\w&.]*){1,4})\s+([a-z].*)$")
+
+# Second fallback for a name that isn't at the start of the text at all
+# (e.g. "Major invoice cancelled ... before work was completed — Economy
+# Pneumatics, ~1.36 Crore ..." - the description comes first, the entity
+# follows a mid-sentence dash) - a short run of 2-4 Capitalized Words
+# right after a "—"/"–", ending at a comma or period, anywhere in the
+# text. Tried only when both extraction methods above find nothing, so a
+# well-formed "Entity — description" bullet still resolves via the
+# faster/more specific method above first.
+_MID_TEXT_ENTITY_RE = re.compile(r"[—–]\s*([A-Z][\w&.]*(?:\s+[A-Z][\w&.]*){1,3})\s*[,.]")
+
+
 def _extract_entity(content: str) -> tuple:
     """Returns (entity, remaining_text). Only splits off an entity when
     the text before the separator passes _looks_like_entity - otherwise
@@ -243,6 +292,19 @@ def _extract_entity(content: str) -> tuple:
         head = hyphen_match.group(1).strip()
         if _looks_like_entity(head):
             return head, hyphen_match.group(2).strip()
+    leading_match = _LEADING_ENTITY_WORDS_RE.match(content)
+    if leading_match:
+        head = leading_match.group(1).strip()
+        if _looks_like_entity(head):
+            return head, leading_match.group(2).strip()
+    mid_match = _MID_TEXT_ENTITY_RE.search(content)
+    if mid_match:
+        candidate = mid_match.group(1).strip()
+        if _looks_like_entity(candidate):
+            # The entity sits inside the sentence rather than at a clean
+            # boundary, so `content` is returned unsplit - it isn't safe
+            # to cut a hole out of the middle of the text.
+            return candidate, content
     return "", content
 
 
@@ -254,13 +316,19 @@ _CLAUSE_DELIM_RE = re.compile(r"[;,.]|—|–|\s-\s")
 
 
 def _split_recommended_action(text: str) -> tuple:
-    """Returns (description, recommended_action). If a recommendation
-    trigger word is found, splits at the nearest preceding clause
-    delimiter (so the recommendation is its own clean sentence/clause);
-    with no delimiter, splits right at the trigger word. With no trigger
-    at all, the whole text is the description and recommended_action is
-    blank - never fabricated.
+    """Returns (description, recommended_action). A "→" marker is the
+    strongest, most explicit signal ("<observation> → <action>") and is
+    checked first; failing that, a recommend/suggest/advise/please
+    trigger word splits at the nearest preceding clause delimiter (so the
+    recommendation is its own clean sentence/clause), or right at the
+    trigger word if there's no delimiter. With no signal at all, the
+    whole text is the description and recommended_action is blank - never
+    fabricated.
     """
+    before_arrow, after_arrow = split_on_arrow(text)
+    if after_arrow:
+        return before_arrow, after_arrow
+
     match = _RECOMMEND_TRIGGER_RE.search(text)
     if not match:
         return text.strip(), ""
@@ -286,7 +354,7 @@ def _parse_generic_item(content: str) -> dict:
     """
     entity, remaining = _extract_entity(content)
     description, recommended_action = _split_recommended_action(remaining)
-    amount = _extract_amount(content)
+    amount = _extract_amount_number(content)
     priority = _classify_priority(content)
     status = _classify_status(content)
     return {
@@ -335,29 +403,27 @@ _CASH_LABELS = [
 ]
 
 
-def _parse_cash(block: str) -> tuple:
-    """Returns ({opening_balance, closing_balance, total_receipts,
-    total_payments}, notes_str). Each field is populated only when a
-    currency-marked amount is found for it; when a label's value instead
-    says something like "not reliably computable", that field is left
-    blank and the raw text is preserved in the returned notes string -
-    per the explicit "leave numeric fields blank, preserve in Notes"
-    rule (this is intentionally different from how Monitoring keeps
-    "Unconfirmed" text directly in a metric field).
+def _parse_cash(block: str) -> dict:
+    """Returns {key: {"amount": number|"", "raw_value": str}} for each of
+    opening_balance/closing_balance/total_receipts/total_payments the
+    report actually mentions - a key the report never labels at all is
+    absent from the result entirely (not just blank), so
+    build_accounting_rows never fabricates a row for a balance that
+    wasn't reported. When a label's value can't be read as an amount
+    (e.g. "not reliably computable due to two unreconciled bank
+    accounts"), amount is left blank rather than guessed; the caller
+    reads raw_value to mark that row's Status (e.g. Unconfirmed) instead
+    of inventing a number - there's no Notes column in the unified
+    schema to hold the full explanation text.
     """
     sliced = _slice_by_labels(block, _CASH_LABELS)
-    values = {"opening_balance": "", "closing_balance": "", "total_receipts": "", "total_payments": ""}
-    notes_parts = []
-    for key in values:
+    result = {}
+    for key in ("opening_balance", "closing_balance", "total_receipts", "total_payments"):
         if key not in sliced:
             continue
-        label_text, raw_value = sliced[key]
-        amount = _extract_amount(raw_value)
-        if amount:
-            values[key] = amount
-        elif raw_value:
-            notes_parts.append(f"{label_text.rstrip(': ').strip()}: {raw_value}")
-    return values, " | ".join(notes_parts)
+        _, raw_value = sliced[key]
+        result[key] = {"amount": _extract_amount_number(raw_value), "raw_value": raw_value}
+    return result
 
 
 _SALES_LABELS = [
@@ -383,13 +449,13 @@ def _parse_sales(block: str) -> dict:
         _, raw_value = sliced[key]
         count_match = re.search(r"\d+", raw_value)
         count = int(count_match.group(0)) if count_match else ""
-        amount = _extract_amount(raw_value)
+        amount = _extract_amount_number(raw_value)
         notes = raw_value if not count and not amount else ""
         result[key] = {"count": count, "value": amount, "notes": notes}
 
     if "receivables" in sliced:
         _, raw_value = sliced["receivables"]
-        amount = _extract_amount(raw_value)
+        amount = _extract_amount_number(raw_value)
         # Aging context ("if any >45 days") is kept regardless of whether
         # an amount was also found, per "preserve aging information".
         result["receivables"] = {"amount": amount, "notes": raw_value}
@@ -418,7 +484,7 @@ def _parse_purchase(block: str) -> dict:
         label_text, raw_value = sliced["bills"]
         count_match = re.search(r"\d+", raw_value)
         bills_count = int(count_match.group(0)) if count_match else ""
-        bills_value = _extract_amount(raw_value)
+        bills_value = _extract_amount_number(raw_value)
         if not bills_count and not bills_value and raw_value:
             notes_parts.append(f"{label_text.rstrip(': ').strip()}: {raw_value}")
     mismatch_text = sliced["mismatch"][1] if "mismatch" in sliced else ""
@@ -459,8 +525,7 @@ def parse_accounting_summary(summary: str) -> dict:
         {
             "date": "YYYY-MM-DD",
             "issues": [{"entity","description","amount","priority","status","recommended_action"}, ...],
-            "cash": {"opening_balance","closing_balance","total_receipts","total_payments"},
-            "cash_notes": str,
+            "cash": {key: {"amount","raw_value"}, ...}  # only keys the report mentions
             "sales": {"invoices": {...}|None, "sales_orders": {...}|None, "receivables": {...}|None},
             "purchase": {"bills_count","bills_value","mismatch_text"},
             "expenses": [same shape as "issues" items, ...],
@@ -506,13 +571,10 @@ def parse_accounting_summary(summary: str) -> dict:
             for line in _block_lines(blocks.get(block_key, ""))
         ]
 
-    cash_values, cash_notes = _parse_cash(blocks.get("cash", ""))
-
     return {
         "date": _parse_date(report_date_raw) if report_date_raw else date.today().isoformat(),
         "issues": _items("issues"),
-        "cash": cash_values,
-        "cash_notes": cash_notes,
+        "cash": _parse_cash(blocks.get("cash", "")),
         "sales": _parse_sales(blocks.get("sales", "")),
         "purchase": _parse_purchase(blocks.get("purchase", "")),
         "expenses": [_parse_generic_item(item) for item in _parse_expenses(blocks.get("expenses", ""))],
@@ -524,6 +586,16 @@ def parse_accounting_summary(summary: str) -> dict:
 # -----------------------------------------------------------------------
 # Unified Accounting sheet schema
 # -----------------------------------------------------------------------
+# ONE ROW = ONE IMPORTANT BUSINESS RECORD, same principle as Monitoring
+# (see summary_parser.py). Claude's generated summary can be detailed;
+# this sheet must not store that narrative. build_accounting_rows below
+# shortens each record's Description/Recommended Action (see
+# _shorten_accounting_description) rather than copying the full bullet,
+# and never fabricates a "ALL ENTITIES"-style aggregate record - Cash,
+# Sales, and Purchase each become their own small set of concrete rows
+# (e.g. a separate Opening balance / Closing balance / Total receipts /
+# Total payments row for Cash) instead of one wide row with a column per
+# figure.
 ACCOUNTING_HEADERS = [
     "Date",
     "Record Type",
@@ -534,17 +606,7 @@ ACCOUNTING_HEADERS = [
     "Priority",
     "Status",
     "Recommended Action",
-    "Opening Balance",
-    "Closing Balance",
-    "Total Receipts",
-    "Total Payments",
-    "Sales Value",
-    "Outstanding Receivables",
-    "Purchase Value",
-    "GSTIN/HSN Mismatch",
-    "GST/Tax Watch",
-    "Pending From Yesterday",
-    "Notes",
+    "Risk / Tax Flag",
 ]
 
 _ACOL = {name: index for index, name in enumerate(ACCOUNTING_HEADERS)}
@@ -557,31 +619,138 @@ def _empty_accounting_row(date_value: str, record_type: str) -> list:
     return row
 
 
+# --- Deterministic Description shortening ---------------------------------
+# Accounting-specific signal vocabulary (Monitoring has its own, unrelated
+# one - see summary_parser.py). Checked in order, first match wins, only
+# when the source text is already long (see text_summarizer.shorten) -
+# short text passes through unchanged. Nothing here is invented: a phrase
+# is only produced when the words that justify it are actually present.
+# Words that mean "this was actually fine" - a bare keyword match like
+# "tds"/"itc"/"rcm"/"mismatch" doesn't by itself mean there's a problem
+# (e.g. "TDS correctly applied" / "RCM correctly reconciled" is GOOD
+# news), so those specific issue-framed phrases are only used when none
+# of these qualifiers are present - otherwise the text falls through to
+# plain truncation instead of being mischaracterized as a discrepancy.
+_POSITIVE_QUALIFIER_RE = re.compile(
+    r"\bcorrectly\b|\bno anomalies\b|\bno lasting issue\b|\bno issue\b|\bresolves\b|\bresolved\b|\bno new\b",
+    re.IGNORECASE,
+)
+
+
+def _accounting_description_signals(text: str):
+    lower = text.lower()
+
+    def has_any(*kws):
+        return any(k in lower for k in kws)
+
+    if has_any("invoice") and has_any("inflated") and has_any("revers", "revert"):
+        return "Purchase invoice inflated then reversed" if has_any("purchase") else "Invoice inflated then reversed"
+
+    if not _POSITIVE_QUALIFIER_RE.search(text):
+        if has_any("itc"):
+            return "Potential ITC discrepancy" if has_any("potential") else "ITC discrepancy"
+        if has_any("rcm"):
+            return "RCM applicability issue"
+        if has_any("tds"):
+            return "TDS discrepancy"
+        if has_any("mismatch"):
+            return "GST/HSN mismatch"
+
+    if has_any("duplicate"):
+        return "Duplicate invoice"
+    if has_any("without supporting voucher", "no voucher", "without voucher"):
+        return "Cash withdrawal without voucher"
+    if has_any("overdue"):
+        return "Payment overdue"
+    return None
+
+
+def _shorten_accounting_description(text: str) -> str:
+    return shorten(text, signal_fn=_accounting_description_signals)
+
+
+# --- Risk / Tax Flag classification ---------------------------------------
+# Deliberately a small set of fixed, canonical tags rather than trying to
+# reproduce a source bullet's exact wording - a stable category (ITC/RCM/
+# TDS/GST/GSTIN-HSN Mismatch) is what a Dashboard would filter/group on,
+# and stays consistent even when two reports describe the same kind of
+# risk in different words.
+def _classify_risk_flag(text: str) -> str:
+    lower = text.lower()
+    if "hsn" in lower and ("gstin" in lower or "mismatch" in lower):
+        return "GSTIN/HSN Mismatch"
+    if "itc" in lower:
+        return "ITC"
+    if "rcm" in lower:
+        return "RCM"
+    if "tds" in lower:
+        return "TDS"
+    if "gst" in lower:
+        return "GST"
+    return ""
+
+
 def _apply_generic_item(row: list, item: dict) -> None:
     """Fills the columns every _parse_generic_item-derived row can use,
     regardless of Record Type - Entity/Amount/Priority/Recommended Action
-    are general-purpose columns, so populating them whenever the parser
-    actually extracted a value keeps the row lossless without needing a
-    per-Record-Type allowlist of which columns "are allowed" to be used.
+    /Risk-Tax-Flag are general-purpose columns, so populating them
+    whenever the parser actually extracted a value keeps the row lossless
+    without needing a per-Record-Type allowlist of which columns "are
+    allowed" to be used. Risk/Tax Flag and Description are classified/
+    shortened from the item's ORIGINAL (un-shortened) description text so
+    a keyword doesn't get lost just because the Description cell itself
+    was shortened to a different phrase.
     """
+    original_description = item["description"]
     row[_ACOL["Entity"]] = item["entity"]
+    row[_ACOL["Description"]] = _shorten_accounting_description(original_description)
     row[_ACOL["Amount"]] = item["amount"]
     row[_ACOL["Priority"]] = item["priority"]
     row[_ACOL["Recommended Action"]] = item["recommended_action"]
+    row[_ACOL["Risk / Tax Flag"]] = _classify_risk_flag(f"{original_description} {item['recommended_action']}")
+
+
+# Short, fixed labels for the Cash & Bank Position sub-records - each
+# becomes its own row rather than one wide row with 4 balance columns.
+_CASH_DESCRIPTIONS = [
+    ("opening_balance", "Opening balance"),
+    ("closing_balance", "Closing balance"),
+    ("total_receipts", "Total receipts"),
+    ("total_payments", "Total payments"),
+]
+
+# Aging context ("outstanding receivables (aging flag if any >45 days)")
+# is real business information worth keeping even though there's no
+# dedicated aging column - folded into the Description as a short
+# parenthetical instead of being dropped entirely.
+_AGING_RE = re.compile(r"\bover\s+\d+\s+days\b", re.IGNORECASE)
+
+# A recognized tax/GST acronym should never itself be swallowed as part
+# of an entity name picked up by _LEADING_ENTITY_WORDS_RE (e.g. "Global
+# Supplies Ltd HSN code mismatch..." must not become entity "Global
+# Supplies Ltd HSN").
+_ENTITY_STOPWORDS = {"HSN", "GST", "GSTIN", "ITC", "TDS", "RCM", "CA"}
+
+# "N" / "No" / "N/A" as the leading answer letter - whether alone or
+# followed by an explanation ("N — no anomalies observed.") - means "no
+# mismatch found", not a genuine finding, so it must never produce a
+# Purchase mismatch row.
+_NO_MISMATCH_RE = re.compile(r"^n(?:o|/a)?\b", re.IGNORECASE)
 
 
 def build_accounting_rows(parsed: dict) -> dict:
     """Convert parse_accounting_summary()'s structured dict into row lists
-    for the unified Accounting sheet (column order: ACCOUNTING_HEADERS).
+    for the unified Accounting sheet (column order: ACCOUNTING_HEADERS,
+    10 columns).
 
     Returns one list per source section (grouping is only so a caller can
     write/dedupe each independently - the sheet itself has no Section
     column, just the Record Type each row carries):
         {
             "issues": [row, ...],      # Record Type = Exception
-            "cash": [row] | [],        # Record Type = Cash, at most 1
+            "cash": [row, ...],        # Record Type = Cash, 0-4
             "sales": [row, ...],       # Record Type = Sale, 0-3
-            "purchase": [row] | [],    # Record Type = Purchase, at most 1
+            "purchase": [row, ...],    # Record Type = Purchase, 0-2
             "expenses": [row, ...],    # Record Type = Expense
             "tax": [row, ...],         # Record Type = Tax
             "pending": [row, ...],     # Record Type = Pending
@@ -589,7 +758,7 @@ def build_accounting_rows(parsed: dict) -> dict:
 
     A section produces no rows when the report has nothing for it - no
     fake exception/purchase/etc. row is ever fabricated just to have
-    something to write.
+    something to write, and there is never an "ALL ENTITIES" aggregate.
     """
     date_value = parsed["date"]
     rows = {"issues": [], "cash": [], "sales": [], "purchase": [], "expenses": [], "tax": [], "pending": []}
@@ -597,78 +766,92 @@ def build_accounting_rows(parsed: dict) -> dict:
     for item in parsed["issues"]:
         row = _empty_accounting_row(date_value, "Exception")
         _apply_generic_item(row, item)
-        row[_ACOL["Description"]] = item["description"]
         row[_ACOL["Status"]] = item["status"] or "Open"
         rows["issues"].append(row)
 
-    cash = parsed["cash"]
-    cash_notes = parsed.get("cash_notes", "")
-    if any(cash.values()) or cash_notes:
+    for key, label in _CASH_DESCRIPTIONS:
+        entry = parsed["cash"].get(key)
+        if entry is None:
+            continue
         row = _empty_accounting_row(date_value, "Cash")
-        row[_ACOL["Opening Balance"]] = cash["opening_balance"]
-        row[_ACOL["Closing Balance"]] = cash["closing_balance"]
-        row[_ACOL["Total Receipts"]] = cash["total_receipts"]
-        row[_ACOL["Total Payments"]] = cash["total_payments"]
-        row[_ACOL["Notes"]] = cash_notes
+        row[_ACOL["Description"]] = label
+        if entry["amount"] != "":
+            row[_ACOL["Amount"]] = entry["amount"]
+        elif entry["raw_value"]:
+            # A label was reported but no amount could be confidently
+            # read from it (e.g. "not reliably computable due to two
+            # unreconciled bank accounts") - leave Amount blank rather
+            # than guess, and surface the uncertainty via Status since
+            # there's no Notes column to hold the full explanation.
+            row[_ACOL["Status"]] = "Unconfirmed"
         rows["cash"].append(row)
 
     sales = parsed["sales"]
-    receivables = sales.get("receivables")
-    receivables_attached = False
-    for key in ("invoices", "sales_orders"):
+    for key, label in (("invoices", "Invoices raised"), ("sales_orders", "Sales orders raised")):
         entry = sales.get(key)
         if not entry:
             continue
         row = _empty_accounting_row(date_value, "Sale")
+        row[_ACOL["Description"]] = label
+        row[_ACOL["Amount"]] = entry["value"]
         row[_ACOL["Count"]] = entry["count"]
-        row[_ACOL["Sales Value"]] = entry["value"]
-        notes_parts = [entry["notes"]] if entry["notes"] else []
-        # Receivables/aging info attaches to the first Sale row written
-        # (invoices takes priority over sales orders) rather than being
-        # duplicated onto every Sale row.
-        if receivables and not receivables_attached:
-            row[_ACOL["Outstanding Receivables"]] = receivables["amount"]
-            if receivables["notes"]:
-                notes_parts.append(receivables["notes"])
-            receivables_attached = True
-        row[_ACOL["Notes"]] = " | ".join(notes_parts)
+        if not entry["count"] and not entry["value"] and entry["notes"]:
+            row[_ACOL["Status"]] = "Unconfirmed"
         rows["sales"].append(row)
 
-    if receivables and not receivables_attached:
+    receivables = sales.get("receivables")
+    if receivables:
+        description = "Outstanding receivables"
+        aging_match = _AGING_RE.search(receivables.get("notes", ""))
+        if aging_match:
+            description += f" ({aging_match.group(0)})"
         row = _empty_accounting_row(date_value, "Sale")
-        row[_ACOL["Outstanding Receivables"]] = receivables["amount"]
-        row[_ACOL["Notes"]] = receivables["notes"]
+        row[_ACOL["Description"]] = description
+        row[_ACOL["Amount"]] = receivables["amount"]
         rows["sales"].append(row)
 
     purchase = parsed["purchase"]
-    if purchase["bills_count"] != "" or purchase["bills_value"] or purchase["mismatch_text"] or purchase.get("notes"):
+    if purchase["bills_count"] != "" or purchase["bills_value"] != "" or purchase.get("notes"):
         row = _empty_accounting_row(date_value, "Purchase")
+        row[_ACOL["Description"]] = "Purchase bills booked"
+        row[_ACOL["Amount"]] = purchase["bills_value"]
         row[_ACOL["Count"]] = purchase["bills_count"]
-        row[_ACOL["Purchase Value"]] = purchase["bills_value"]
-        row[_ACOL["GSTIN/HSN Mismatch"]] = purchase["mismatch_text"]
-        row[_ACOL["Notes"]] = purchase.get("notes", "")
+        if purchase["bills_count"] == "" and purchase["bills_value"] == "" and purchase.get("notes"):
+            row[_ACOL["Status"]] = "Unconfirmed"
+        rows["purchase"].append(row)
+
+    mismatch_text = purchase.get("mismatch_text", "").strip()
+    if mismatch_text and not _NO_MISMATCH_RE.match(mismatch_text):
+        mismatch_body = re.sub(r"^Y\s*[-—–:]\s*", "", mismatch_text, flags=re.IGNORECASE).strip()
+        entity, remaining = _extract_entity(mismatch_body)
+        if entity:
+            head_words = entity.split()
+            while head_words and head_words[-1].upper().rstrip(".,") in _ENTITY_STOPWORDS:
+                remaining = f"{head_words.pop()} {remaining}".strip()
+            entity = " ".join(head_words)
+        description_source = remaining if entity else mismatch_body
+        row = _empty_accounting_row(date_value, "Purchase")
+        row[_ACOL["Entity"]] = entity
+        row[_ACOL["Description"]] = _shorten_accounting_description(description_source) or "GST/HSN mismatch"
+        row[_ACOL["Status"]] = _classify_status(mismatch_text, default="Open")
+        row[_ACOL["Risk / Tax Flag"]] = "GSTIN/HSN Mismatch"
         rows["purchase"].append(row)
 
     for item in parsed["expenses"]:
         row = _empty_accounting_row(date_value, "Expense")
         _apply_generic_item(row, item)
-        row[_ACOL["Description"]] = item["description"]
         rows["expenses"].append(row)
 
     for item in parsed["tax"]:
         row = _empty_accounting_row(date_value, "Tax")
         _apply_generic_item(row, item)
-        row[_ACOL["Description"]] = item["description"]
-        row[_ACOL["GST/Tax Watch"]] = item["description"]
-        row[_ACOL["Status"]] = item["status"]
+        row[_ACOL["Status"]] = item["status"] or "Open"
         rows["tax"].append(row)
 
     for item in parsed["pending"]:
         row = _empty_accounting_row(date_value, "Pending")
         _apply_generic_item(row, item)
-        row[_ACOL["Description"]] = item["description"]
-        row[_ACOL["Pending From Yesterday"]] = item["description"]
-        row[_ACOL["Status"]] = item["status"] or "Open"
+        row[_ACOL["Status"]] = item["status"] or "Pending"
         rows["pending"].append(row)
 
     return rows

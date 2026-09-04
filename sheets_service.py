@@ -31,29 +31,49 @@ def _quoted_range(tab_name: str, cell_range: str = "") -> str:
     return f"{quoted_tab}!{cell_range}" if cell_range else quoted_tab
 
 
-def ensure_tab(service, spreadsheet_id: str, tab_name: str, headers: list) -> None:
-    """Make sure `tab_name` exists with `headers` as its first row.
+def _end_column_letter(headers: list) -> str:
+    """The A1 column letter for the last of `headers` (e.g. 10 headers -> 'J')."""
+    return chr(ord("A") + len(headers) - 1)
 
-    No-op if the tab already exists, so this is safe to call on every
-    write without disturbing existing rows.
+
+def ensure_tab(service, spreadsheet_id: str, tab_name: str, headers: list) -> None:
+    """Make sure `tab_name` exists AND has `headers` as its first row.
+
+    Creates the tab (with headers) if it doesn't exist yet. Also backfills
+    the header row if the tab already exists but is completely empty - this
+    happens when a tab is created directly in the Sheets UI (as opposed to
+    by this code) rather than actually being a no-op for any pre-existing
+    tab: without this, the first real row written would land in row 1 and
+    every downstream reader (including this module's own append_unique_rows/
+    upsert_row_by_key, which both assume row 1 is a header via `values[1:]`)
+    would silently misread that first data row as the header. Never touches
+    a tab that already has ANY row (never overwrites a real header, and
+    never assumes a differently-shaped existing row 1 is wrong).
     """
     metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
     existing_titles = {s["properties"]["title"] for s in metadata.get("sheets", [])}
 
-    if tab_name in existing_titles:
+    if tab_name not in existing_titles:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+        ).execute()
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=_quoted_range(tab_name, "A1"),
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute()
         return
 
-    service.spreadsheets().batchUpdate(
-        spreadsheetId=spreadsheet_id,
-        body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
-    ).execute()
-
-    service.spreadsheets().values().update(
-        spreadsheetId=spreadsheet_id,
-        range=_quoted_range(tab_name, "A1"),
-        valueInputOption="RAW",
-        body={"values": [headers]},
-    ).execute()
+    existing_values = get_tab_values(service, spreadsheet_id, tab_name)
+    if not existing_values:
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=_quoted_range(tab_name, "A1"),
+            valueInputOption="RAW",
+            body={"values": [headers]},
+        ).execute()
 
 
 def get_tab_values(service, spreadsheet_id: str, tab_name: str) -> list:
@@ -95,7 +115,14 @@ def append_unique_rows(
 
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=_quoted_range(tab_name, "A:Z"),
+        # Bounded to the schema's exact column width (e.g. "A:J" for 10
+        # headers), not a wide-open "A:Z" - an unbounded range gives
+        # Sheets' append-time table-detection room to misjudge which
+        # existing row/columns are "the table" on a tab with no
+        # established data yet, which was observed to make rapid
+        # sequential appends land at drifting column offsets instead of
+        # column A. Bounding to the real width removes that ambiguity.
+        range=_quoted_range(tab_name, f"A:{_end_column_letter(headers)}"),
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": new_rows},
@@ -126,7 +153,7 @@ def upsert_row_by_key(
             existing_row[i] if i < len(existing_row) else "" for i in key_indexes
         )
         if existing_key == key_value:
-            end_col = chr(ord("A") + len(headers) - 1)
+            end_col = _end_column_letter(headers)
             service.spreadsheets().values().update(
                 spreadsheetId=spreadsheet_id,
                 range=_quoted_range(tab_name, f"A{row_index}:{end_col}{row_index}"),
@@ -137,7 +164,9 @@ def upsert_row_by_key(
 
     service.spreadsheets().values().append(
         spreadsheetId=spreadsheet_id,
-        range=_quoted_range(tab_name, "A:Z"),
+        # See the matching comment in append_unique_rows: bounded to the
+        # schema's real width rather than a wide-open "A:Z".
+        range=_quoted_range(tab_name, f"A:{_end_column_letter(headers)}"),
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},

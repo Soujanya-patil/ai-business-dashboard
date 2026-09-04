@@ -52,6 +52,8 @@ gracefully instead (see _block_lines' collapsed-newline recovery).
 import re
 from datetime import date, datetime
 
+from text_summarizer import shorten, split_on_arrow
+
 TITLE_RE = re.compile(r"PLANT\s+MONITORING\s+SUMMARY", re.IGNORECASE)
 
 # Optional decoration (emoji/symbols, e.g. "⚠️") immediately before a
@@ -661,20 +663,38 @@ def parse_monitoring_summary(summary: str) -> dict:
 # -----------------------------------------------------------------------
 # Unified Monitoring sheet schema
 # -----------------------------------------------------------------------
-# All five sections write into ONE "Monitoring" tab as plain operational
+# All four sections write into ONE "Monitoring" tab as plain operational
 # rows - no "Section" column. This is a business-facing schema (built for
 # a founder/manager scanning the sheet directly), not an internal
 # bookkeeping one, so which SUMMARY SECTION a row came from is not itself
-# a column; instead each row stands on its own as an issue/action/KPI
-# entry. The Daily Summary section becomes one row per date with
-# Site = "ALL SITES" (see build_monitoring_rows), which is what a
-# dashboard formula would filter on to find the daily KPI row.
+# a column; instead each row stands on its own as a real, site-level
+# issue/action record. ONE ROW = ONE IMPORTANT BUSINESS RECORD - never an
+# aggregate, and never the entire narrative. The day's New Issues / Issues
+# Resolved / Total Open Issues figures from ISSUES TODAY are NOT written
+# as a row here at all (there is no "ALL SITES" or other synthetic
+# aggregate site, and there are no dedicated columns for them either) -
+# see parse_monitoring_summary()'s returned "new_issues"/"resolved_issues"
+# /"total_open_issues"/"issues_today_notes" for that data; the MCP tool
+# surfaces them in its response text, and a future Dashboard tab is
+# expected to derive daily KPIs from the individual rows via formulas.
+#
+# CONCISENESS: Claude's generated summary can be as detailed as it likes;
+# this sheet must not store that narrative verbatim. build_monitoring_rows
+# below extracts a short Issue/Next Action phrase from each item's full
+# extracted text (see _shorten_issue_text/_shorten_action_text) rather
+# than copying whole sentences into a cell - text that's already short is
+# left untouched (nothing gained by shortening it further), long text is
+# either matched against a small set of known operational signal phrases
+# (deterministic, no LLM - a handful of keyword combinations that cover
+# the common real-world cases) or, if nothing matches, plainly truncated
+# to a word count. Nothing is ever invented - a signal phrase is only
+# used when the words that justify it are actually present in the text.
 #
 # This is a separate transformation step on top of
 # parse_monitoring_summary()'s output above - the section-detection and
 # per-item text extraction (site/multi-site splitting, days-open,
 # per-site value mapping, etc.) is untouched by it, this just reshapes
-# already-parsed data into flat rows plus a few best-effort
+# and shortens already-parsed data into flat rows plus a few best-effort
 # classifications (Category/Priority/Status - see _classify_* below).
 MONITORING_HEADERS = [
     "Date",
@@ -687,10 +707,6 @@ MONITORING_HEADERS = [
     "Action Taken",
     "Next Action",
     "Vendor",
-    "New Issues",
-    "Issues Resolved",
-    "Total Open Issues",
-    "Notes",
 ]
 
 # Column name -> position, so row-building reads as named slots instead
@@ -759,6 +775,104 @@ def _classify_status(text: str, default: str = "") -> str:
     return default
 
 
+# --- Next Action extraction ----------------------------------------------
+# Same idea as accounting_parser.py's recommended-action split: an
+# explicit "→" marker is the strongest signal ("<observation> → <what to
+# do>"); failing that, a recommend/suggest/advise/please trigger word,
+# split at the nearest preceding clause delimiter so the action comes out
+# as its own clean clause. No trigger at all -> no Next Action, blank
+# rather than guessed.
+_ACTION_TRIGGER_RE = re.compile(
+    r"\brecommend(?:ed|ation)?\b|\bsuggest(?:ed|ion)?\b|\badvis(?:e|ed|ory)\b|\bplease\b",
+    re.IGNORECASE,
+)
+_CLAUSE_DELIM_RE = re.compile(r"[;,.]|—|–|\s-\s")
+
+
+def _split_next_action(text: str) -> tuple:
+    before, after = split_on_arrow(text)
+    if after:
+        return before, after
+
+    match = _ACTION_TRIGGER_RE.search(text)
+    if not match:
+        return text.strip(), ""
+    before = text[: match.start()]
+    delims = list(_CLAUSE_DELIM_RE.finditer(before))
+    if delims:
+        cut = delims[-1].end()
+        remaining = before[: delims[-1].start()].strip()
+        action = text[cut:].strip()
+    else:
+        remaining = before.strip()
+        action = text[match.start():].strip()
+    return remaining, action
+
+
+# --- Deterministic Issue/Action shortening --------------------------------
+# A small, hand-picked set of operational signal phrases covering the
+# common real-world cases (outage/inverter/optimizer trouble, power cuts,
+# sites not reporting, GST/HSN mismatches). Checked only when the source
+# text is already longer than a normal concise phrase (see
+# text_summarizer.shorten) - short text is left exactly as written.
+def _issue_signals(text: str):
+    lower = text.lower()
+
+    def has_any(*kws):
+        return any(k in lower for k in kws)
+
+    signals = []
+
+    if has_any("outage"):
+        signals.append("Full inverter outage" if has_any("inverter") and has_any("full", "all") else
+                        "Inverter outage" if has_any("inverter") else "Outage")
+    elif has_any("inverter") and has_any("trip", "tripping", "tripped"):
+        signals.append("Inverter tripping")
+    elif has_any("inverter") and has_any("fail", "failure", "fault", "down"):
+        signals.append("Inverter failure")
+
+    if has_any("optimizer") and has_any("down", "fail", "failure"):
+        signals.append("Optimizer failures")
+
+    if len(signals) < 2 and has_any("power cut", "powercut"):
+        signals.append("Power cut")
+    if len(signals) < 2 and has_any("no communication"):
+        signals.append("No communication")
+    if len(signals) < 2 and has_any("not appearing", "no report", "not reporting"):
+        signals.append("Not reporting")
+    if len(signals) < 2 and has_any("gst mismatch", "hsn mismatch"):
+        signals.append("GST/HSN mismatch")
+
+    if not signals:
+        return None
+    return " + ".join(signals[:2])
+
+
+def _action_signals(text: str):
+    lower = text.lower()
+
+    def has_any(*kws):
+        return any(k in lower for k in kws)
+
+    if has_any("priority escalation"):
+        return "Priority escalation"
+    if has_any("chartered accountant") or re.search(r"\bca\b", lower):
+        return "Confirm with CA"
+    if has_any("vendor") and has_any("follow up", "followup", "contact"):
+        return "Follow up with vendor"
+    if has_any("verify", "confirm"):
+        return "Verify details"
+    return None
+
+
+def _shorten_issue_text(text: str) -> str:
+    return shorten(text, signal_fn=_issue_signals)
+
+
+def _shorten_action_text(text: str) -> str:
+    return shorten(text, signal_fn=_action_signals, concise_words=6, truncate_words=6)
+
+
 def _empty_row(date_value: str, site: str = "") -> list:
     row = [""] * len(MONITORING_HEADERS)
     row[_COL["Date"]] = date_value
@@ -769,77 +883,87 @@ def _empty_row(date_value: str, site: str = "") -> list:
 def build_monitoring_rows(parsed: dict) -> dict:
     """Convert parse_monitoring_summary()'s structured dict into row lists
     for the unified Monitoring sheet (column order: MONITORING_HEADERS,
-    no Section column).
+    10 columns, no Section column).
 
     Returns one list per section of the SOURCE summary (this grouping is
     purely so a caller can write/dedupe each independently - it has no
     bearing on the sheet, which has no Section column):
         {
-            "daily_summary": [row],                 # always exactly 1,
-                                                      # Site = "ALL SITES"
             "needs_attention": [row, ...],
             "actions_taken": [row, ...],
             "whats_needed_next": [row, ...],
             "service_pattern_watch": [row, ...],
         }
 
-    Category/Priority/Status are best-effort classifications from
-    keyword rules (see _classify_* above) - never invented when the text
-    doesn't clearly indicate one, left blank instead. Fields a section's
-    bullet doesn't cleanly supply are also left blank rather than
-    guessed; any leftover context that doesn't map to a dedicated column
-    lands in Notes instead of being discarded.
+    Deliberately produces NO row for the day's New Issues / Issues
+    Resolved / Total Open Issues figures - ONE ROW = ONE IMPORTANT
+    BUSINESS RECORD, and a day-wide total isn't one. Those three figures
+    (plus any extra context that didn't fit them, in
+    parsed["issues_today_notes"]) stay available on the returned `parsed`
+    dict for a caller to surface however it chooses (see
+    process_monitoring_summary's response text) without ever being
+    written to the sheet as a synthetic "ALL SITES" row.
+
+    Issue/Action Taken/Next Action are shortened (see _shorten_issue_text
+    /_shorten_action_text above) rather than storing the full extracted
+    text verbatim - Claude's summary can be detailed, this sheet isn't.
+    Category/Priority/Status are classified from the FULL original text
+    (more signal to work with) even though the stored Issue text is
+    shortened. Fields a section's bullet doesn't cleanly supply are left
+    blank rather than guessed.
     """
     date_value = parsed["date"]
-
-    daily_row = _empty_row(date_value, "ALL SITES")
-    daily_row[_COL["Issue"]] = "Daily operational summary"
-    daily_row[_COL["New Issues"]] = parsed["new_issues"]
-    daily_row[_COL["Issues Resolved"]] = parsed["resolved_issues"]
-    daily_row[_COL["Total Open Issues"]] = parsed["total_open_issues"]
-    daily_row[_COL["Notes"]] = parsed.get("issues_today_notes", "")
 
     needs_attention_rows = []
     for item in parsed["needs_attention"]:
         description = item["description"]
+        remaining, action_clause = _split_next_action(description)
         row = _empty_row(date_value, item["site"])
-        row[_COL["Issue"]] = description
+        row[_COL["Issue"]] = _shorten_issue_text(remaining)
         row[_COL["Category"]] = _classify_category(description)
         row[_COL["Priority"]] = _classify_priority(description)
         row[_COL["Status"]] = _classify_status(description, default="Open")
         row[_COL["Days Open"]] = item["days_open"]
+        if action_clause:
+            row[_COL["Next Action"]] = _shorten_action_text(action_clause)
         needs_attention_rows.append(row)
 
     actions_taken_rows = []
     for item in parsed["actions_taken"]:
         combined = f"{item['description']} {item['action']}".strip()
+        remaining, action_clause = _split_next_action(item["action"])
         row = _empty_row(date_value, item["site"])
         # Issue falls back to the action text itself when there's no
         # separately-extracted issue, so the column is never blank
         # while Action Taken has real content.
-        row[_COL["Issue"]] = item["description"] or item["action"]
+        issue_source = item["description"] or item["action"]
+        row[_COL["Issue"]] = _shorten_issue_text(issue_source)
         row[_COL["Category"]] = _classify_category(combined)
         row[_COL["Priority"]] = _classify_priority(combined)
         row[_COL["Status"]] = _classify_status(combined, default="Open")
-        row[_COL["Action Taken"]] = item["action"]
+        row[_COL["Action Taken"]] = _shorten_issue_text(remaining)
+        if action_clause:
+            row[_COL["Next Action"]] = _shorten_action_text(action_clause)
         actions_taken_rows.append(row)
 
     whats_needed_next_rows = []
     for item in parsed["whats_needed_next"]:
         requirement = item["requirement"]
         row = _empty_row(date_value, item["site"])
-        row[_COL["Issue"]] = requirement
+        shortened = _shorten_issue_text(requirement)
+        row[_COL["Issue"]] = shortened
         row[_COL["Category"]] = _classify_category(requirement)
         row[_COL["Priority"]] = _classify_priority(requirement)
         row[_COL["Status"]] = _classify_status(requirement, default="Open")
-        row[_COL["Next Action"]] = requirement
+        row[_COL["Next Action"]] = shortened
         whats_needed_next_rows.append(row)
 
     service_pattern_watch_rows = []
     for item in parsed["service_pattern_watch"]:
         combined = f"{item['pattern']} {item['notes']}".strip()
+        remaining, action_clause = _split_next_action(combined)
         row = _empty_row(date_value, item["site"])
-        row[_COL["Issue"]] = item["pattern"]
+        row[_COL["Issue"]] = _shorten_issue_text(item["pattern"])
         row[_COL["Category"]] = _classify_category(combined)
         row[_COL["Priority"]] = _classify_priority(combined)
         # Service Pattern Watch defaults to "Monitoring" (an observed,
@@ -847,11 +971,11 @@ def build_monitoring_rows(parsed: dict) -> dict:
         # awaiting resolution the way Needs Attention items are.
         row[_COL["Status"]] = _classify_status(combined, default="Monitoring")
         row[_COL["Vendor"]] = item["vendor"]
-        row[_COL["Notes"]] = item["notes"]
+        if action_clause:
+            row[_COL["Next Action"]] = _shorten_action_text(action_clause)
         service_pattern_watch_rows.append(row)
 
     return {
-        "daily_summary": [daily_row],
         "needs_attention": needs_attention_rows,
         "actions_taken": actions_taken_rows,
         "whats_needed_next": whats_needed_next_rows,

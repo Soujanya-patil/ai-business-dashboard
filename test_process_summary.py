@@ -6,9 +6,14 @@ Run with:
 This exercises the full flow (raw summary text -> parser -> row-building ->
 Google Sheets) using the credentials.json / SPREADSHEET_ID already
 configured in mcp_server.py. The Sheets-writing/idempotency checks write
-real rows into the single unified "Monitoring" tab (14-column business
-schema, no Section column - see summary_parser.MONITORING_HEADERS). No
-Anthropic API call is involved.
+real rows into the single unified "Monitoring" tab (10-column, concise
+business schema, no Section column - see summary_parser.MONITORING_HEADERS).
+No Anthropic API call is involved.
+
+ONE ROW = ONE IMPORTANT BUSINESS RECORD: long narrative Issue/Action Taken/
+Next Action text is shortened before being stored (see summary_parser.
+_shorten_issue_text/_shorten_action_text) rather than kept verbatim - Test 5b
+below reproduces the exact worked example from the schema spec end to end.
 
 Covers two input shapes:
   A. The clean template (REPORTED_BUG_SUMMARY, NO_ISSUES_SUMMARY).
@@ -92,25 +97,43 @@ EXPECTED_PARSED_BUG_SUMMARY = {
 
 # Expected unified-schema rows for REPORTED_BUG_SUMMARY, in MONITORING_HEADERS
 # column order: Date, Site, Issue, Category, Priority, Status, Days Open,
-# Action Taken, Next Action, Vendor, New Issues, Issues Resolved,
-# Total Open Issues, Notes. No Section column.
+# Action Taken, Next Action, Vendor. No Section column, no New Issues/
+# Issues Resolved/Total Open Issues/Notes columns, and no aggregate row -
+# see ONE_ROW_ONE_RECORD tests below for why there's no "daily_summary" key.
+# Every bullet here is already short (<= 12 words), so nothing gets
+# shortened further - see Test 5b for a bullet long enough to trigger
+# shortening.
 EXPECTED_BUG_SUMMARY_ROWS = {
-    "daily_summary": [
-        ["2026-09-02", "ALL SITES", "Daily operational summary", "", "", "", "", "", "", "", 3, 2, 7, ""]
-    ],
     "needs_attention": [
-        ["2026-09-02", "Bengaluru", "Inverter failure — awaiting vendor replacement", "Inverter", "", "Open", 8, "", "", "", "", "", "", ""]
+        ["2026-09-02", "Bengaluru", "Inverter failure — awaiting vendor replacement", "Inverter", "", "Open", 8, "", "", ""]
     ],
     "actions_taken": [
-        ["2026-09-02", "Mysuru", "Panel fault", "Service", "", "Open", "", "replacement scheduled", "", "", "", "", "", ""]
+        ["2026-09-02", "Mysuru", "Panel fault", "Service", "", "Open", "", "replacement scheduled", "", ""]
     ],
     "whats_needed_next": [
-        ["2026-09-02", "", "Approval needed for expedited shipping", "", "", "Open", "", "", "Approval needed for expedited shipping", "", "", "", "", ""]
+        ["2026-09-02", "", "Approval needed for expedited shipping", "", "", "Open", "", "", "Approval needed for expedited shipping", ""]
     ],
     "service_pattern_watch": [
-        ["2026-09-02", "", "Recurring inverter failures at Bengaluru site", "Inverter", "", "Monitoring", "", "", "", "", "", "", "", ""]
+        ["2026-09-02", "", "Recurring inverter failures at Bengaluru site", "Inverter", "", "Monitoring", "", "", "", ""]
     ],
 }
+
+# The exact worked example from the schema spec: a long narrative bullet
+# that MUST be shortened rather than stored verbatim, while Category/
+# Priority/Status/Next Action are still correctly derived from the full
+# text. This is the canonical "ONE ROW = ONE IMPORTANT BUSINESS RECORD"
+# proof for Monitoring.
+LONG_NARRATIVE_SUMMARY = """
+SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03 Sep 2026
+
+NEEDS ATTENTION
+- 079 Oaza Global Krishnagiri — full outage today (all 4 inverters down, 280 min collectively) plus 31 optimizers at 100% down and 59 at 50% down out of 615, with remark inverter no 5 is not working. Recommend priority escalation to resolve before end of day.
+"""
+
+EXPECTED_LONG_NARRATIVE_ROW = [
+    "2026-09-03", "079 Oaza Global Krishnagiri", "Full inverter outage + Optimizer failures",
+    "Outage", "Critical", "Open", "", "", "Priority escalation", "",
+]
 
 # A summary with nothing to escalate - none of these sections should
 # produce fabricated rows. Also parser-only (no Sheets write).
@@ -232,14 +255,15 @@ SERVICE PATTERN WATCH
 
 
 if __name__ == "__main__":
-    print("=== Test 1: exact 14-column schema, no Section column ===")
+    print("=== Test 1: exact 10-column schema, no Section column ===")
     assert MONITORING_HEADERS == [
         "Date", "Site", "Issue", "Category", "Priority", "Status", "Days Open",
-        "Action Taken", "Next Action", "Vendor", "New Issues", "Issues Resolved",
-        "Total Open Issues", "Notes",
+        "Action Taken", "Next Action", "Vendor",
     ], f"Unexpected schema: {MONITORING_HEADERS}"
-    assert len(MONITORING_HEADERS) == 14
+    assert len(MONITORING_HEADERS) == 10
     assert "Section" not in MONITORING_HEADERS
+    for removed in ("New Issues", "Issues Resolved", "Total Open Issues", "Notes"):
+        assert removed not in MONITORING_HEADERS, f"{removed!r} should have been removed from the schema"
     print("OK\n")
 
     print("=== Test 2: sections with no real data produce no rows ===")
@@ -268,19 +292,39 @@ if __name__ == "__main__":
     )
     print("OK: collapsed single-line input parses identically to normal multi-line input.\n")
 
-    print("=== Test 5: build_monitoring_rows() maps the clean summary to the correct 14-column rows ===")
+    print("=== Test 5: build_monitoring_rows() maps the clean summary to the correct 10-column rows ===")
     bug_rows = build_monitoring_rows(bug_parsed)
+    assert "daily_summary" not in bug_rows, "build_monitoring_rows() must not produce an aggregate row at all"
+    assert set(bug_rows.keys()) == {"needs_attention", "actions_taken", "whats_needed_next", "service_pattern_watch"}
     for section, expected_rows in EXPECTED_BUG_SUMMARY_ROWS.items():
         actual_rows = bug_rows[section]
         assert actual_rows == expected_rows, f"{section}: expected {expected_rows}, got {actual_rows}"
         for row in actual_rows:
-            assert len(row) == 14, f"{section} row has wrong column count: {row}"
-    print("OK: all five sections produced the correct 14-column Monitoring row(s).\n")
+            assert len(row) == 10, f"{section} row has wrong column count: {row}"
+    print("OK: all four sections produced the correct 10-column Monitoring row(s); no aggregate section at all.\n")
 
-    print("=== Test 6: Daily Summary KPI row uses Site = 'ALL SITES' ===")
-    assert bug_rows["daily_summary"][0][MONITORING_HEADERS.index("Site")] == "ALL SITES"
-    assert bug_rows["daily_summary"][0][MONITORING_HEADERS.index("Issue")] == "Daily operational summary"
-    print("OK: Daily Summary row correctly uses Site = 'ALL SITES'.\n")
+    print("=== Test 5b: long narrative text is SHORTENED into a concise structured row (schema spec worked example) ===")
+    long_parsed = parse_monitoring_summary(LONG_NARRATIVE_SUMMARY)
+    long_rows = build_monitoring_rows(long_parsed)
+    assert len(long_rows["needs_attention"]) == 1, long_rows["needs_attention"]
+    actual_long_row = long_rows["needs_attention"][0]
+    assert actual_long_row == EXPECTED_LONG_NARRATIVE_ROW, (
+        f"Expected {EXPECTED_LONG_NARRATIVE_ROW}, got {actual_long_row}"
+    )
+    original_bullet_word_count = len(long_parsed["needs_attention"][0]["description"].split())
+    shortened_issue_word_count = len(actual_long_row[MONITORING_HEADERS.index("Issue")].split())
+    assert original_bullet_word_count > 30, "Fixture bullet should be long enough to actually exercise shortening"
+    assert shortened_issue_word_count <= 6, (
+        f"Issue cell must be a short phrase, not the {original_bullet_word_count}-word original bullet: {actual_long_row}"
+    )
+    print(f"Original bullet: {original_bullet_word_count} words -> stored Issue: {shortened_issue_word_count} words")
+    print("OK: the full paragraph was never stored - Sheets got a concise structured row instead.\n")
+
+    print("=== Test 6: daily metrics are NOT lost - still available on the parsed dict, just not as a row ===")
+    assert bug_parsed["new_issues"] == 3
+    assert bug_parsed["resolved_issues"] == 2
+    assert bug_parsed["total_open_issues"] == 7
+    print("OK: New Issues / Issues Resolved / Total Open Issues remain fully parsed and accessible.\n")
 
     print("=== Test 7: a summary without a Service Pattern Watch section still works ===")
     no_spw = MESSY_SUMMARY.split("SERVICE PATTERN WATCH")[0]
@@ -302,7 +346,23 @@ if __name__ == "__main__":
     print(f"service_pattern_watch rows built: {len(messy_rows['service_pattern_watch'])}")
     print("OK: all five sections detected.\n")
 
-    print("=== Test 9: Unconfirmed metrics are preserved, not converted to 0 ===")
+    print("=== Test 9: 'ALL SITES' (or any equivalent aggregate label) is never created, in any build ===")
+    _AGGREGATE_LABELS = {"ALL SITES", "ALL", "TOTAL"}
+    site_idx = MONITORING_HEADERS.index("Site")
+    for label, row_dict in (("clean summary", bug_rows), ("messy summary", messy_rows), ("no-SPW summary", no_spw_rows)):
+        assert "daily_summary" not in row_dict, f"{label}: build_monitoring_rows() must not return an aggregate section"
+        all_produced_rows = [row for section_rows in row_dict.values() for row in section_rows]
+        assert all_produced_rows, f"{label}: expected at least one real row to check"
+        for row in all_produced_rows:
+            site_value = row[site_idx].strip().upper()
+            assert site_value not in _AGGREGATE_LABELS, (
+                f"{label}: found aggregate Site label {row[site_idx]!r} in row {row} - "
+                "every row must be a real operational record"
+            )
+    print("OK: scanned every row produced by both the clean and messy summaries - no aggregate")
+    print("    Site label ('ALL SITES', 'ALL', 'TOTAL') anywhere, and no 'daily_summary' section at all.\n")
+
+    print("=== Test 10: Unconfirmed metrics are preserved, not converted to 0 ===")
     assert isinstance(messy_parsed["new_issues"], str) and "Unconfirmed" in messy_parsed["new_issues"], (
         f"Expected new_issues to preserve 'Unconfirmed' text, got: {messy_parsed['new_issues']!r}"
     )
@@ -312,16 +372,13 @@ if __name__ == "__main__":
     assert messy_parsed["total_open_issues"] == 18, (
         f"Expected total_open_issues to parse the explicit number 18, got: {messy_parsed['total_open_issues']!r}"
     )
-    daily_kpi_row = messy_rows["daily_summary"][0]
-    assert daily_kpi_row[MONITORING_HEADERS.index("Site")] == "ALL SITES"
-    assert "Unconfirmed" in str(daily_kpi_row[MONITORING_HEADERS.index("New Issues")])
-    assert daily_kpi_row[MONITORING_HEADERS.index("Total Open Issues")] == 18
+    assert "daily_summary" not in messy_rows, "No aggregate row/section for the messy summary either"
     print("new_issues:", messy_parsed["new_issues"])
     print("resolved_issues:", messy_parsed["resolved_issues"])
     print("total_open_issues:", messy_parsed["total_open_issues"])
     print("OK: 'Unconfirmed' preserved verbatim; explicit numeric value still parsed when present.\n")
 
-    print("=== Test 10: multiple-site bullets are split into rows, not silently lost ===")
+    print("=== Test 11: multiple-site bullets are split into rows, not silently lost ===")
     na_sites = [item["site"] for item in messy_parsed["needs_attention"]]
     for code in ("034 IIM Bangalore-2023", "017 Prabhu Kanakpura Road",
                  "075 nVent Rajadhani Paper Bidadi", "066 Matrinox Riddhi Siddhi Metal Jigani"):
@@ -344,7 +401,7 @@ if __name__ == "__main__":
     assert len(messy_parsed["needs_attention"]) == 8, len(messy_parsed["needs_attention"])
     print("OK: multi-site bullets correctly split into per-site rows, with per-site values mapped by position.\n")
 
-    print("=== Test 11: numbered next-action items are preserved individually ===")
+    print("=== Test 12: numbered next-action items are preserved individually ===")
     requirements = [item["requirement"] for item in messy_parsed["whats_needed_next"]]
     assert len(requirements) == 4, f"Expected 4 numbered items, got {len(requirements)}: {requirements}"
     assert any("Master Issue Tracker" in r for r in requirements)
@@ -355,7 +412,7 @@ if __name__ == "__main__":
         assert row[MONITORING_HEADERS.index("Next Action")], "Every What's Needed Next row must populate Next Action"
     print("OK: all 4 numbered items preserved as individual rows, full text intact.\n")
 
-    print("=== Test 12: Service Pattern Watch information becomes normal Monitoring rows ===")
+    print("=== Test 13: Service Pattern Watch information becomes normal Monitoring rows ===")
     spw_rows = messy_rows["service_pattern_watch"]
     spw_sites = [row[MONITORING_HEADERS.index("Site")] for row in spw_rows]
     assert "079 Oaza Global Krishnagiri" in spw_sites, (
@@ -375,13 +432,13 @@ if __name__ == "__main__":
     print("OK: Service Pattern Watch produced normal rows (no separate Section/sheet), with sites correctly")
     print("    identified from both a bare leading name and an inline multi-site mention.\n")
 
-    print("=== Test 13: Actions Taken qualifiers are preserved, not stripped ===")
+    print("=== Test 14: Actions Taken qualifiers are preserved, not stripped ===")
     actions_text = " | ".join(item["action"] for item in messy_parsed["actions_taken"])
     for qualifier in ("tomorrow", "not explicitly dated to today"):
         assert qualifier in actions_text, f"Expected qualifier {qualifier!r} to survive somewhere in Actions Taken"
     print("OK: qualifiers like 'tomorrow' and 'not explicitly dated to today' survived.\n")
 
-    print("=== Test 14: no useful information disappears (spot-check distinctive phrases across all rows) ===")
+    print("=== Test 15: no useful information disappears (spot-check distinctive phrases across all rows) ===")
     full_dump = str(messy_parsed) + str(messy_rows)
     for phrase in (
         "inverter no 5 is not working",
@@ -392,7 +449,7 @@ if __name__ == "__main__":
         assert phrase in full_dump, f"Expected {phrase!r} to appear somewhere in the parsed output"
     print("OK: spot-checked distinctive phrases all survived somewhere in the output.\n")
 
-    print("=== Test 15: Google Sheets integration + idempotency check (clean-template style) ===")
+    print("=== Test 16: Google Sheets integration + idempotency check (clean-template style) ===")
     run_uuid = uuid.uuid4()
     run_id = run_uuid.hex[:10]
     synthetic_date = f"2099-{(run_uuid.int % 12) + 1:02d}-{(run_uuid.int % 28) + 1:02d}"
@@ -405,13 +462,20 @@ if __name__ == "__main__":
     assert "Actions Taken: 1 row(s)" in result_1
     assert "What's Needed Next: 1 row(s)" in result_1
     assert "Service Pattern Watch: 1 row(s)" in result_1
+    assert "ALL SITES" not in result_1, "Response text must never mention an aggregate site"
+    assert "Daily Summary: updated" not in result_1, "Daily Summary is no longer written as a row"
+    assert "Daily metrics" in result_1, "Daily New Issues/Resolved/Total Open figures must still be reported back"
 
     all_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
     header = all_rows[0]
     assert header == MONITORING_HEADERS, f"Live sheet header does not match: {header}"
     tagged_rows = [row for row in all_rows if any(run_id in str(cell) for cell in row)]
+    site_idx = MONITORING_HEADERS.index("Site")
     for row in tagged_rows:
         assert row[0] == synthetic_date, f"Row has wrong date: {row}"
+        assert row[site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
+            f"Found an aggregate Site value actually written to the live sheet: {row}"
+        )
 
     result_2 = process_monitoring_summary(summary_text)
     print(result_2)
@@ -426,7 +490,7 @@ if __name__ == "__main__":
     )
     print(f"OK: first write created {len(tagged_rows)} new rows; duplicate write created 0 more. Live header verified.\n")
 
-    print("=== Test 16: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
+    print("=== Test 17: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
     messy_run_uuid = uuid.uuid4()
     messy_run_id = messy_run_uuid.hex[:10]
     messy_synthetic_date = f"2099-{(messy_run_uuid.int % 12) + 1:02d}-{(messy_run_uuid.int % 28) + 1:02d}"
@@ -441,11 +505,19 @@ if __name__ == "__main__":
     assert "Actions Taken: 1 row(s)" in messy_result_1, messy_result_1
     assert "What's Needed Next: 2 row(s)" in messy_result_1, messy_result_1
     assert "Service Pattern Watch: 2 row(s)" in messy_result_1, messy_result_1
+    assert "ALL SITES" not in messy_result_1
+    assert "Daily metrics" in messy_result_1
+    assert "Unconfirmed" in messy_result_1, "The Unconfirmed New Issues figure must still be reported back"
 
     messy_tagged_before = [
         row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
         if any(messy_run_id in str(cell) for cell in row)
     ]
+    messy_site_idx = MONITORING_HEADERS.index("Site")
+    for row in messy_tagged_before:
+        assert row[messy_site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
+            f"Found an aggregate Site value actually written to the live sheet: {row}"
+        )
 
     messy_result_2 = process_monitoring_summary(messy_summary_text)
     print(messy_result_2)

@@ -6,9 +6,16 @@ Run with:
 Exercises the full flow (raw Day Book summary text -> parser -> row-
 building -> Google Sheets) using the credentials.json / SPREADSHEET_ID
 already configured in mcp_server.py. The Sheets-writing/idempotency check
-writes real rows into the "Accounting" tab (20-column schema, Record Type
-column - see accounting_parser.ACCOUNTING_HEADERS). No Anthropic API call
-is involved.
+writes real rows into the "Accounting" tab (10-column, concise business
+schema, Record Type column - see accounting_parser.ACCOUNTING_HEADERS). No
+Anthropic API call is involved.
+
+ONE ROW = ONE IMPORTANT BUSINESS RECORD: long narrative Description text is
+shortened before being stored (see accounting_parser.
+_shorten_accounting_description) and Cash/Sales/Purchase each become several
+small concrete rows instead of one wide row with a column per figure - Test
+13 below reproduces the exact worked examples from the schema spec end to
+end (including a bare-integer Amount, e.g. 1606711 not "₹16,06,711").
 
 Determinism note: the Sheets-writing/idempotency check generates fresh,
 uniquely-tagged content on every run (see _build_unique_summary) and uses
@@ -57,9 +64,10 @@ PENDING FROM YESTERDAY
 """
 
 # Uncertain wording, missing values, "none"/no-mismatch cases - the
-# explicit uncertainty phrases from the spec must survive as-is, numeric
-# fields must stay blank (never a fabricated 0) when the report itself
-# says a figure isn't computable.
+# explicit uncertainty phrases from the spec must survive (as a Status,
+# since there's no Notes column in the unified schema), numeric fields
+# must stay blank (never a fabricated 0) when the report itself says a
+# figure isn't computable.
 UNCERTAIN_SUMMARY = """SUNTROP SOLAR — DAY BOOK SUMMARY | 04 Sep 2026
 
 ISSUES REQUIRING ATTENTION (if any)
@@ -88,6 +96,22 @@ PENDING FROM YESTERDAY
 - Vendor Global Supplies Ltd — HSN mismatch still pending vendor response
 - TDS deduction on professional fees not yet verified against 26AS, potential issue
 """
+
+# The exact worked example from the schema spec: a long narrative
+# Exception bullet with an entity buried mid-sentence (no leading
+# separator), an amount in Rs (not ₹), and a "→" recommended-action
+# marker - must come out as a concise, fully-populated 10-column row,
+# never the original paragraph.
+LONG_NARRATIVE_SUMMARY = """SUNTROP SOLAR — DAY BOOK SUMMARY | 05 Sep 2026
+
+ISSUES REQUIRING ATTENTION (if any)
+- Micronova Impex invoice was inflated and then subsequently reversed within the same settlement window, which is a critical concern raising a potential ITC overclaim risk of approximately Rs 16,06,711 that should be flagged before month-end filing. → Confirm with CA
+"""
+
+EXPECTED_LONG_NARRATIVE_ROW = [
+    "2026-09-05", "Exception", "Micronova Impex", "Invoice inflated then reversed", 1606711,
+    "", "Critical", "Unconfirmed", "Confirm with CA", "ITC",
+]
 
 
 def _build_unique_summary(run_id: str, report_date: str) -> str:
@@ -125,121 +149,137 @@ PENDING FROM YESTERDAY
 
 
 if __name__ == "__main__":
-    print("=== Test 1: exact 20-column Accounting schema ===")
+    print("=== Test 1: exact 10-column Accounting schema ===")
     assert ACCOUNTING_HEADERS == [
         "Date", "Record Type", "Entity", "Description", "Amount", "Count",
-        "Priority", "Status", "Recommended Action", "Opening Balance",
-        "Closing Balance", "Total Receipts", "Total Payments", "Sales Value",
-        "Outstanding Receivables", "Purchase Value", "GSTIN/HSN Mismatch",
-        "GST/Tax Watch", "Pending From Yesterday", "Notes",
+        "Priority", "Status", "Recommended Action", "Risk / Tax Flag",
     ], f"Unexpected schema: {ACCOUNTING_HEADERS}"
-    assert len(ACCOUNTING_HEADERS) == 20
+    assert len(ACCOUNTING_HEADERS) == 10
     assert "Section" not in ACCOUNTING_HEADERS
+    for removed in (
+        "Opening Balance", "Closing Balance", "Total Receipts", "Total Payments",
+        "Sales Value", "Outstanding Receivables", "Purchase Value",
+        "GSTIN/HSN Mismatch", "GST/Tax Watch", "Pending From Yesterday", "Notes",
+    ):
+        assert removed not in ACCOUNTING_HEADERS, f"{removed!r} should have been removed from the schema"
     print("OK\n")
 
     print("=== Test 2: correct tab name 'Accounting' ===")
     assert ACCOUNTING_TAB == "Accounting"
     print("OK\n")
 
-    print("=== Test 3: clean summary - all sections parse, multiple rows per section ===")
+    print("=== Test 3: clean summary - all sections parse, multiple rows per section, all rows 10 columns ===")
     parsed = parse_accounting_summary(CLEAN_SUMMARY)
     rows = build_accounting_rows(parsed)
     assert parsed["date"] == "2026-09-03"
     assert len(rows["issues"]) == 2, f"Expected 2 exceptions, got {len(rows['issues'])}"
-    assert len(rows["cash"]) == 1
-    assert len(rows["sales"]) == 2, f"Expected 2 Sale rows (invoices + orders), got {len(rows['sales'])}"
-    assert len(rows["purchase"]) == 1
+    assert len(rows["cash"]) == 4, f"Expected 4 Cash rows (opening/closing/receipts/payments), got {len(rows['cash'])}"
+    assert len(rows["sales"]) == 3, f"Expected 3 Sale rows (invoices + orders + receivables), got {len(rows['sales'])}"
+    assert len(rows["purchase"]) == 1, "N mismatch must not produce a second Purchase row"
     assert len(rows["expenses"]) == 1
     assert len(rows["tax"]) == 2, f"Expected 2 tax watch rows, got {len(rows['tax'])}"
     assert len(rows["pending"]) == 2, f"Expected 2 pending rows, got {len(rows['pending'])}"
     for section_rows in rows.values():
         for row in section_rows:
-            assert len(row) == 20, f"Row has wrong column count: {row}"
-    print("OK: all 7 sections produced correct row counts, all rows are 20 columns.\n")
+            assert len(row) == 10, f"Row has wrong column count: {row}"
+    print("OK: all 7 sections produced correct row counts, all rows are 10 columns; no wide multi-balance row.\n")
 
-    print("=== Test 4: multiple exceptions mapped correctly (Record Type, Entity, Amount, Priority, Status) ===")
+    print("=== Test 4: multiple exceptions mapped correctly (Entity, Amount as bare integer, Priority, Status, Risk/Tax Flag) ===")
     issue_rows = rows["issues"]
     assert all(row[ACCOUNTING_HEADERS.index("Record Type")] == "Exception" for row in issue_rows)
     entities = {row[ACCOUNTING_HEADERS.index("Entity")] for row in issue_rows}
     assert "ABC Traders" in entities
     assert "Vendor XYZ Pvt Ltd" in entities
     amounts = {row[ACCOUNTING_HEADERS.index("Amount")] for row in issue_rows}
-    assert "₹12,000" in amounts and "₹45,000" in amounts
+    assert 12000 in amounts and 45000 in amounts, f"Amounts must be bare integers, got {amounts}"
     critical_row = next(r for r in issue_rows if r[ACCOUNTING_HEADERS.index("Entity")] == "Vendor XYZ Pvt Ltd")
     assert critical_row[ACCOUNTING_HEADERS.index("Priority")] == "Critical"
     assert critical_row[ACCOUNTING_HEADERS.index("Status")] == "Open"
+    gst_row = next(r for r in issue_rows if r[ACCOUNTING_HEADERS.index("Entity")] == "ABC Traders")
+    assert gst_row[ACCOUNTING_HEADERS.index("Risk / Tax Flag")] == "GST"
     print("OK\n")
 
-    print("=== Test 5: cash position mapped correctly ===")
-    cash_row = rows["cash"][0]
-    assert cash_row[ACCOUNTING_HEADERS.index("Record Type")] == "Cash"
-    assert cash_row[ACCOUNTING_HEADERS.index("Opening Balance")] == "₹1,50,000"
-    assert cash_row[ACCOUNTING_HEADERS.index("Closing Balance")] == "₹1,80,000"
-    assert cash_row[ACCOUNTING_HEADERS.index("Total Receipts")] == "₹80,000"
-    assert cash_row[ACCOUNTING_HEADERS.index("Total Payments")] == "₹50,000"
+    print("=== Test 5: Cash position becomes 4 separate concise rows, not one wide row ===")
+    cash_by_desc = {r[ACCOUNTING_HEADERS.index("Description")]: r for r in rows["cash"]}
+    assert set(cash_by_desc) == {"Opening balance", "Closing balance", "Total receipts", "Total payments"}
+    assert cash_by_desc["Opening balance"][ACCOUNTING_HEADERS.index("Amount")] == 150000
+    assert cash_by_desc["Closing balance"][ACCOUNTING_HEADERS.index("Amount")] == 180000
+    assert cash_by_desc["Total receipts"][ACCOUNTING_HEADERS.index("Amount")] == 80000
+    assert cash_by_desc["Total payments"][ACCOUNTING_HEADERS.index("Amount")] == 50000
+    for row in rows["cash"]:
+        assert row[ACCOUNTING_HEADERS.index("Record Type")] == "Cash"
     print("OK\n")
 
-    print("=== Test 6: sales with invoices AND sales orders as separate rows ===")
+    print("=== Test 6: sales with invoices AND sales orders as separate rows, receivables its own row ===")
     sales_rows = rows["sales"]
     assert all(r[ACCOUNTING_HEADERS.index("Record Type")] == "Sale" for r in sales_rows)
-    counts_values = {(r[ACCOUNTING_HEADERS.index("Count")], r[ACCOUNTING_HEADERS.index("Sales Value")]) for r in sales_rows}
-    assert (5, "₹2,50,000") in counts_values, counts_values
-    assert (2, "₹90,000") in counts_values, counts_values
-    receivables_rows = [r for r in sales_rows if r[ACCOUNTING_HEADERS.index("Outstanding Receivables")]]
-    assert len(receivables_rows) == 1, "Expected receivables attached to exactly one Sale row"
-    assert receivables_rows[0][ACCOUNTING_HEADERS.index("Outstanding Receivables")] == "₹3,20,000"
-    assert "45 days" in receivables_rows[0][ACCOUNTING_HEADERS.index("Notes")]
+    counts_amounts = {(r[ACCOUNTING_HEADERS.index("Count")], r[ACCOUNTING_HEADERS.index("Amount")]) for r in sales_rows if r[ACCOUNTING_HEADERS.index("Count")] != ""}
+    assert (5, 250000) in counts_amounts, counts_amounts
+    assert (2, 90000) in counts_amounts, counts_amounts
+    receivables_row = next(r for r in sales_rows if "Outstanding receivables" in r[ACCOUNTING_HEADERS.index("Description")])
+    assert receivables_row[ACCOUNTING_HEADERS.index("Amount")] == 320000
+    assert "45 days" in receivables_row[ACCOUNTING_HEADERS.index("Description")], (
+        "Aging risk info must be preserved even without a dedicated aging column"
+    )
     print("OK\n")
 
-    print("=== Test 7: purchase information mapped correctly ===")
+    print("=== Test 7: purchase information mapped correctly; bare 'N' produces no mismatch row ===")
     purchase_row = rows["purchase"][0]
     assert purchase_row[ACCOUNTING_HEADERS.index("Record Type")] == "Purchase"
     assert purchase_row[ACCOUNTING_HEADERS.index("Count")] == 3
-    assert purchase_row[ACCOUNTING_HEADERS.index("Purchase Value")] == "₹1,10,000"
-    assert purchase_row[ACCOUNTING_HEADERS.index("GSTIN/HSN Mismatch")] == "N"
+    assert purchase_row[ACCOUNTING_HEADERS.index("Amount")] == 110000
+    assert len(rows["purchase"]) == 1, "A bare 'N' mismatch answer must not create a second Purchase row"
     print("OK\n")
 
-    print("=== Test 8: expenses/journal entries mapped correctly ===")
+    print("=== Test 8: expenses/journal entries mapped correctly, Amount as bare integer ===")
     expense_row = rows["expenses"][0]
     assert expense_row[ACCOUNTING_HEADERS.index("Record Type")] == "Expense"
     assert "Office rent" in expense_row[ACCOUNTING_HEADERS.index("Description")]
-    assert expense_row[ACCOUNTING_HEADERS.index("Amount")] == "₹40,000"
+    assert expense_row[ACCOUNTING_HEADERS.index("Amount")] == 40000
     print("OK\n")
 
-    print("=== Test 9: GST/Tax watch items mapped correctly, including Unconfirmed status ===")
+    print("=== Test 9: GST/Tax watch items mapped correctly, including Unconfirmed status and Risk/Tax Flag ===")
     tax_rows = rows["tax"]
     assert all(r[ACCOUNTING_HEADERS.index("Record Type")] == "Tax" for r in tax_rows)
-    itc_row = next(r for r in tax_rows if "ITC" in r[ACCOUNTING_HEADERS.index("GST/Tax Watch")])
-    assert itc_row[ACCOUNTING_HEADERS.index("Amount")] == "₹8,000"
+    itc_row = next(r for r in tax_rows if "ITC" in r[ACCOUNTING_HEADERS.index("Description")])
+    assert itc_row[ACCOUNTING_HEADERS.index("Amount")] == 8000
     assert "recommend CA review" in itc_row[ACCOUNTING_HEADERS.index("Recommended Action")]
-    rcm_row = next(r for r in tax_rows if "RCM" in r[ACCOUNTING_HEADERS.index("GST/Tax Watch")])
+    assert itc_row[ACCOUNTING_HEADERS.index("Risk / Tax Flag")] == "ITC"
+    rcm_row = next(r for r in tax_rows if "RCM" in r[ACCOUNTING_HEADERS.index("Description")])
     assert rcm_row[ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed"
+    assert rcm_row[ACCOUNTING_HEADERS.index("Risk / Tax Flag")] == "RCM"
     print("OK\n")
 
-    print("=== Test 10: pending-from-yesterday items mapped correctly ===")
+    print("=== Test 10: pending-from-yesterday items mapped correctly, default Status=Pending ===")
     pending_rows = rows["pending"]
     assert all(r[ACCOUNTING_HEADERS.index("Record Type")] == "Pending" for r in pending_rows)
     assert any(r[ACCOUNTING_HEADERS.index("Entity")] == "Vendor ABC Traders" for r in pending_rows)
-    assert all(r[ACCOUNTING_HEADERS.index("Pending From Yesterday")] for r in pending_rows)
+    assert all(r[ACCOUNTING_HEADERS.index("Description")] for r in pending_rows)
+    assert all(r[ACCOUNTING_HEADERS.index("Status")] == "Pending" for r in pending_rows)
     print("OK\n")
 
-    print("=== Test 11: uncertain wording preserved, missing values stay blank (never fabricated) ===")
+    print("=== Test 11: uncertain wording surfaces as Status=Unconfirmed, missing values stay blank (never fabricated) ===")
     u_parsed = parse_accounting_summary(UNCERTAIN_SUMMARY)
     u_rows = build_accounting_rows(u_parsed)
 
-    u_cash = u_rows["cash"][0]
-    assert u_cash[ACCOUNTING_HEADERS.index("Opening Balance")] == "", "Opening Balance must stay blank, not a fabricated 0"
-    assert "not reliably computable" in u_cash[ACCOUNTING_HEADERS.index("Notes")]
-    assert u_cash[ACCOUNTING_HEADERS.index("Total Payments")] == "", "Total Payments must stay blank"
-    assert "not derivable" in u_cash[ACCOUNTING_HEADERS.index("Notes")]
-    assert u_cash[ACCOUNTING_HEADERS.index("Closing Balance")] == "₹2,10,000", "Explicit figures must still be parsed"
+    u_cash_by_desc = {r[ACCOUNTING_HEADERS.index("Description")]: r for r in u_rows["cash"]}
+    assert u_cash_by_desc["Opening balance"][ACCOUNTING_HEADERS.index("Amount")] == "", (
+        "Opening balance Amount must stay blank, not a fabricated 0"
+    )
+    assert u_cash_by_desc["Opening balance"][ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed"
+    assert u_cash_by_desc["Total payments"][ACCOUNTING_HEADERS.index("Amount")] == ""
+    assert u_cash_by_desc["Total payments"][ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed"
+    assert u_cash_by_desc["Closing balance"][ACCOUNTING_HEADERS.index("Amount")] == 210000, (
+        "Explicit figures must still be parsed"
+    )
 
-    u_purchase = u_rows["purchase"][0]
-    assert u_purchase[ACCOUNTING_HEADERS.index("Count")] == "", "Bill count must stay blank when reported as Unconfirmed"
-    assert "Unconfirmed" in u_purchase[ACCOUNTING_HEADERS.index("Notes")]
-    assert u_purchase[ACCOUNTING_HEADERS.index("GSTIN/HSN Mismatch")] == (
-        "Y — Global Supplies Ltd HSN code mismatch on invoice #4521, needs confirmation"
-    ), u_purchase[ACCOUNTING_HEADERS.index("GSTIN/HSN Mismatch")]
+    u_purchase_bills = next(r for r in u_rows["purchase"] if r[ACCOUNTING_HEADERS.index("Description")] == "Purchase bills booked")
+    assert u_purchase_bills[ACCOUNTING_HEADERS.index("Count")] == "", "Bill count must stay blank when reported as Unconfirmed"
+    assert u_purchase_bills[ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed"
+    u_mismatch_row = next(r for r in u_rows["purchase"] if r[ACCOUNTING_HEADERS.index("Risk / Tax Flag")] == "GSTIN/HSN Mismatch")
+    assert u_mismatch_row[ACCOUNTING_HEADERS.index("Entity")] == "Global Supplies Ltd", (
+        f"Entity must not swallow the 'HSN' acronym: {u_mismatch_row}"
+    )
 
     assert u_rows["expenses"] == [], "A bare 'none' must not create a fabricated Expense row"
     assert u_rows["tax"] == [], "An empty/placeholder Tax section must not create a fabricated row"
@@ -248,13 +288,48 @@ if __name__ == "__main__":
     assert u_issue[ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed", (
         "'needs confirmation' must map to Status=Unconfirmed, never a false Open/Resolved"
     )
+    assert u_issue[ACCOUNTING_HEADERS.index("Description")] == "Cash withdrawal without voucher"
 
     tds_row = next(r for r in u_rows["pending"] if "TDS" in r[ACCOUNTING_HEADERS.index("Description")])
     assert tds_row[ACCOUNTING_HEADERS.index("Status")] == "Unconfirmed", "'potential' must map to Status=Unconfirmed"
+    assert tds_row[ACCOUNTING_HEADERS.index("Risk / Tax Flag")] == "TDS"
     print("OK: 'not reliably computable' / 'not derivable' / 'Unconfirmed' / 'needs confirmation' / 'potential'")
-    print("    all preserved without inventing numbers or false statuses.\n")
+    print("    all preserved as Status=Unconfirmed without inventing numbers or false statuses.\n")
 
-    print("=== Test 12: Google Sheets integration + idempotency check ===")
+    print("=== Test 12: 'N — no anomalies observed'-style negative answers still produce no mismatch row ===")
+    n_summary = CLEAN_SUMMARY.replace(
+        "- Any vendor GSTIN/HSN mismatches: N",
+        "- Any vendor GSTIN/HSN mismatches: N — no anomalies observed.",
+    )
+    n_parsed = parse_accounting_summary(n_summary)
+    n_rows = build_accounting_rows(n_parsed)
+    assert len(n_rows["purchase"]) == 1, (
+        f"'N — no anomalies observed.' must still count as no genuine mismatch, got {len(n_rows['purchase'])} Purchase row(s)"
+    )
+    print("OK\n")
+
+    print("=== Test 13: long narrative text is SHORTENED into a concise, fully-populated row (schema spec worked example) ===")
+    long_parsed = parse_accounting_summary(LONG_NARRATIVE_SUMMARY)
+    long_rows = build_accounting_rows(long_parsed)
+    assert len(long_rows["issues"]) == 1, long_rows["issues"]
+    actual_long_row = long_rows["issues"][0]
+    assert actual_long_row == EXPECTED_LONG_NARRATIVE_ROW, (
+        f"Expected {EXPECTED_LONG_NARRATIVE_ROW}, got {actual_long_row}"
+    )
+    original_word_count = len(long_parsed["issues"][0]["description"].split())
+    shortened_word_count = len(actual_long_row[ACCOUNTING_HEADERS.index("Description")].split())
+    assert original_word_count > 25, "Fixture bullet should be long enough to actually exercise shortening"
+    assert shortened_word_count <= 6, (
+        f"Description cell must be a short phrase, not the {original_word_count}-word original bullet: {actual_long_row}"
+    )
+    assert isinstance(actual_long_row[ACCOUNTING_HEADERS.index("Amount")], int), (
+        "Amount must be a bare integer, not a formatted currency string"
+    )
+    print(f"Original bullet: {original_word_count} words -> stored Description: {shortened_word_count} words")
+    print(f"Amount: {actual_long_row[ACCOUNTING_HEADERS.index('Amount')]} (bare integer, not '₹16,06,711')")
+    print("OK: the full paragraph was never stored - Sheets got a concise, fully-populated row instead.\n")
+
+    print("=== Test 14: Google Sheets integration + idempotency check ===")
     run_uuid = uuid.uuid4()
     run_id = run_uuid.hex[:10]
     synthetic_date = f"2099-{(run_uuid.int % 12) + 1:02d}-{(run_uuid.int % 28) + 1:02d}"
@@ -280,8 +355,8 @@ if __name__ == "__main__":
     # synthetic date instead - equally reliable since a fresh date is
     # generated every run specifically to avoid cross-run collisions.
     date_rows = [row for row in all_rows if row[0] == synthetic_date]
-    # 1 issue + 1 cash + 2 sales + 1 purchase + 1 expense + 1 tax + 1 pending = 8
-    assert len(date_rows) == 8, f"Expected 8 rows for date {synthetic_date!r} on first write, got {len(date_rows)}"
+    # 1 issue + 4 cash + 2 sales + 1 purchase + 1 expense + 1 tax + 1 pending = 11
+    assert len(date_rows) == 11, f"Expected 11 rows for date {synthetic_date!r} on first write, got {len(date_rows)}"
     tagged_rows = [row for row in date_rows if any(run_id in str(cell) for cell in row)]
     assert len(tagged_rows) == 4, f"Expected 4 run_id-tagged rows (issue/expense/tax/pending), got {len(tagged_rows)}"
 
@@ -300,7 +375,7 @@ if __name__ == "__main__":
     assert len(date_rows_after) == len(date_rows), (
         f"Row count for date {synthetic_date!r} changed after a duplicate write: {len(date_rows)} -> {len(date_rows_after)}"
     )
-    print(f"OK: first write created {len(date_rows)} rows total (incl. 1 Cash + 1 Purchase upsert); "
-          "duplicate write created 0 additional rows, and Cash/Purchase were updated in place, not duplicated.\n")
+    print(f"OK: first write created {len(date_rows)} rows total (incl. 4 Cash + 1 Purchase upserts); "
+          "duplicate write created 0 additional rows, and Cash/Purchase sub-records were updated in place, not duplicated.\n")
 
     print("All process_accounting_summary() tests passed.")

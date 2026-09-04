@@ -1,0 +1,411 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>AI Business Dashboard</title>
+<style>
+  :root {
+    --bg: light-dark(#f7f7f5, #1b1b1a);
+    --card-bg: light-dark(#ffffff, #262625);
+    --border: light-dark(#e6e4df, #3a3937);
+    --text: light-dark(#20201e, #f0efec);
+    --text-muted: light-dark(#6b6a66, #a3a29d);
+    --accent: light-dark(#c15f3c, #e08a63);
+    --critical: #c0392b;
+    --high: #d68910;
+    --medium: #7d8c4a;
+    --low: #6b6a66;
+    --open: #b8560f;
+    --resolved: #4c7a4c;
+    --unconfirmed: #9a6b1f;
+    color-scheme: light dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.5 -apple-system, "Segoe UI", system-ui, sans-serif;
+    padding: 16px;
+  }
+  h1 { font-size: 16px; margin: 0; }
+  h2 { font-size: 13px; margin: 0 0 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .meta { font-size: 11px; color: var(--text-muted); }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--card-bg); color: var(--text); cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .kpi { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+  .kpi .value { font-size: 22px; font-weight: 600; }
+  .kpi .label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
+  .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--text-muted); font-weight: 500; }
+  tr:last-child td { border-bottom: none; }
+  .empty { color: var(--text-muted); font-style: italic; padding: 6px 0; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #fff; }
+  .pill.Critical { background: var(--critical); }
+  .pill.High { background: var(--high); }
+  .pill.Medium { background: var(--medium); }
+  .pill.Low { background: var(--low); }
+  .status { font-size: 11px; font-weight: 600; }
+  .status.Open { color: var(--open); }
+  .status.Resolved { color: var(--resolved); }
+  .status.Unconfirmed { color: var(--unconfirmed); }
+  .status.Monitoring { color: var(--text-muted); }
+  .chipbar { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 11px; }
+  .chip b { color: var(--text); }
+  .sourcebadge { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-muted); }
+  #root.loading { opacity: .5; }
+  #error { color: var(--critical); padding: 8px 0; display: none; }
+</style>
+</head>
+<body>
+  <div class="topbar">
+    <h1>AI Business Dashboard</h1>
+    <div style="display:flex; align-items:center; gap:10px;">
+      <span class="meta" id="updated-at"></span>
+      <button id="refresh-btn">Refresh</button>
+    </div>
+  </div>
+  <div id="error"></div>
+  <div id="root" class="loading">
+    <div class="empty">Waiting for dashboard data…</div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- MCP Apps host bridge -------------------------------------------
+  // This page runs inside a sandboxed iframe. It never talks to Google
+  // Sheets, Anthropic, or any external API directly - it only exchanges
+  // JSON-RPC messages with the host window via postMessage, per the
+  // MCP Apps extension (io.modelcontextprotocol/ui). The host is the one
+  // holding real credentials; this page only ever sees the already-
+  // computed dashboard JSON the get_business_dashboard tool returns.
+  var TOOL_NAME = "get_business_dashboard";
+  var nextId = 1;
+  var pending = {};
+
+  function send(payload) {
+    window.parent.postMessage(payload, "*");
+  }
+
+  function request(method, params) {
+    var id = nextId++;
+    return new Promise(function (resolve, reject) {
+      pending[id] = { resolve: resolve, reject: reject };
+      send({ jsonrpc: "2.0", id: id, method: method, params: params || {} });
+    });
+  }
+
+  function notify(method, params) {
+    send({ jsonrpc: "2.0", method: method, params: params || {} });
+  }
+
+  window.addEventListener("message", function (event) {
+    var msg = event.data;
+    if (!msg || msg.jsonrpc !== "2.0") return;
+
+    if (msg.id !== undefined && pending[msg.id]) {
+      var callbacks = pending[msg.id];
+      delete pending[msg.id];
+      if (msg.error) {
+        callbacks.reject(new Error(msg.error.message || "MCP request failed"));
+      } else {
+        callbacks.resolve(msg.result);
+      }
+      return;
+    }
+
+    if (msg.method === "ui/notifications/tool-result") {
+      handleToolResult(msg.params);
+    }
+  });
+
+  function initialize() {
+    request("ui/initialize", {
+      appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+      clientInfo: { name: "AI Business Dashboard", version: "1.0.0" },
+      protocolVersion: "2026-01-26",
+    })
+      .then(function (result) {
+        applyHostTheme(result && result.hostContext);
+        notify("ui/notifications/initialized");
+        // A host that opened this view already carrying this call's
+        // result delivers it via ui/notifications/tool-result right
+        // after initialization - render() below waits for that. If this
+        // view was opened with no prior tool call (e.g. reopened later),
+        // proactively ask for fresh data instead of sitting empty.
+        if (result && result.hostContext && !result.hostContext.toolInfo) {
+          refresh();
+        }
+      })
+      .catch(function (err) {
+        showError("Could not initialize dashboard: " + err.message);
+      });
+  }
+
+  function applyHostTheme(hostContext) {
+    if (!hostContext) return;
+    if (hostContext.theme) {
+      document.documentElement.setAttribute("data-theme", hostContext.theme);
+    }
+    var vars = hostContext.styles && hostContext.styles.variables;
+    if (vars) {
+      Object.keys(vars).forEach(function (key) {
+        document.documentElement.style.setProperty(key, vars[key]);
+      });
+    }
+  }
+
+  function handleToolResult(params) {
+    if (!params) return;
+    var data = params.structuredContent;
+    if (!data) {
+      showError("Tool result had no structured dashboard data.");
+      return;
+    }
+    render(data);
+  }
+
+  function refresh() {
+    var btn = document.getElementById("refresh-btn");
+    var root = document.getElementById("root");
+    btn.disabled = true;
+    root.classList.add("loading");
+    request("tools/call", { name: TOOL_NAME, arguments: {} })
+      .then(function (result) {
+        if (result && result.structuredContent) {
+          render(result.structuredContent);
+        } else {
+          showError("Refresh returned no structured data.");
+        }
+      })
+      .catch(function (err) {
+        showError("Refresh failed: " + err.message);
+      })
+      .finally(function () {
+        btn.disabled = false;
+        root.classList.remove("loading");
+      });
+  }
+
+  document.getElementById("refresh-btn").addEventListener("click", refresh);
+
+  function showError(message) {
+    var el = document.getElementById("error");
+    el.textContent = message;
+    el.style.display = message ? "block" : "none";
+  }
+
+  // ---- Rendering ---------------------------------------------------------
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+
+  function fmtAmount(v) {
+    if (v === "" || v === null || v === undefined) return "—";
+    var n = Number(v);
+    if (isNaN(n)) return esc(v);
+    return "₹" + n.toLocaleString("en-IN");
+  }
+
+  function pill(priority) {
+    if (!priority) return "";
+    return '<span class="pill ' + esc(priority) + '">' + esc(priority) + "</span>";
+  }
+
+  function statusTag(status) {
+    if (!status) return "";
+    return '<span class="status ' + esc(status) + '">' + esc(status) + "</span>";
+  }
+
+  function table(headers, rows, rowToCells, emptyMessage) {
+    if (!rows || rows.length === 0) {
+      return '<div class="empty">' + esc(emptyMessage || "No data.") + "</div>";
+    }
+    var head = "<tr>" + headers.map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("") + "</tr>";
+    var body = rows.map(function (r) { return "<tr>" + rowToCells(r).join("") + "</tr>"; }).join("");
+    return "<table>" + head + body + "</table>";
+  }
+
+  function td(v) { return "<td>" + esc(v) + "</td>"; }
+
+  function renderOverview(o) {
+    var cash = o.cash_position || {};
+    var cashClosing = cash["Closing balance"];
+    return (
+      '<div class="kpis">' +
+      kpi(o.total_open_issues, "Open Issues") +
+      kpi(o.critical_high_issues, "Critical / High") +
+      kpi(o.needs_attention_count, "Needs Attention") +
+      kpi(o.accounting_exceptions, "Accounting Exceptions") +
+      kpi(fmtAmount(o.sales_total), "Sales Total") +
+      kpi(fmtAmount(o.purchase_total), "Purchase Total") +
+      (o.outstanding_receivables_total ? kpi(fmtAmount(o.outstanding_receivables_total), "Outstanding Receivables") : "") +
+      (cashClosing ? kpi(fmtAmount(cashClosing), "Cash Balance (" + esc(cash.as_of || "") + ")") : "") +
+      "</div>"
+    );
+  }
+
+  function kpi(value, label) {
+    return '<div class="kpi"><div class="value">' + esc(value) + '</div><div class="label">' + esc(label) + "</div></div>";
+  }
+
+  function chipbar(counts) {
+    var keys = Object.keys(counts || {});
+    if (keys.length === 0) return '<div class="empty">None.</div>';
+    return (
+      '<div class="chipbar">' +
+      keys.map(function (k) { return '<div class="chip"><b>' + esc(counts[k]) + "</b> " + esc(k) + "</div>"; }).join("") +
+      "</div>"
+    );
+  }
+
+  function renderMonitoring(m) {
+    var html = "";
+    html += '<div class="card"><h2>Priority Breakdown</h2>' + chipbar(m.by_priority) + "</div>";
+    html += '<div class="card"><h2>Issue Categories</h2>' + chipbar(m.by_category) + "</div>";
+    html += '<div class="card"><h2>Sites Needing Attention</h2>' + table(
+      ["Site", "Issue", "Priority", "Status", "Days Open"],
+      m.sites_needing_attention,
+      function (r) { return [td(r.site), td(r.issue), "<td>" + pill(r.priority) + "</td>", "<td>" + statusTag(r.status) + "</td>", td(r.days_open)]; },
+      "No open sites currently need attention."
+    ) + "</div>";
+    html += '<div class="card"><h2>Recent Actions Taken</h2>' + table(
+      ["Date", "Site", "Action Taken"],
+      m.recent_actions,
+      function (r) { return [td(r.date), td(r.site), td(r.action_taken)]; },
+      "No actions recorded yet."
+    ) + "</div>";
+    html += '<div class="card"><h2>Next Actions</h2>' + table(
+      ["Date", "Site", "Next Action"],
+      m.recent_next_actions,
+      function (r) { return [td(r.date), td(r.site), td(r.next_action)]; },
+      "No pending next actions."
+    ) + "</div>";
+    if (m.open_issues_trend && m.open_issues_trend.length > 1) {
+      html += '<div class="card"><h2>Open Issues Trend</h2>' + sparkline(m.open_issues_trend) + "</div>";
+    }
+    return html;
+  }
+
+  function sparkline(points) {
+    var max = Math.max.apply(null, points.map(function (p) { return p.open_issues; }).concat([1]));
+    var w = 260, h = 48, step = points.length > 1 ? w / (points.length - 1) : 0;
+    var coords = points.map(function (p, i) {
+      var x = i * step;
+      var y = h - (p.open_issues / max) * h;
+      return x + "," + y;
+    });
+    var last = points[points.length - 1];
+    return (
+      '<svg width="' + w + '" height="' + (h + 16) + '" style="overflow:visible">' +
+      '<polyline points="' + coords.join(" ") + '" fill="none" stroke="var(--accent)" stroke-width="2" />' +
+      '<text x="0" y="' + (h + 14) + '" font-size="10" fill="var(--text-muted)">' + esc(points[0].date) + "</text>" +
+      '<text x="' + w + '" y="' + (h + 14) + '" font-size="10" fill="var(--text-muted)" text-anchor="end">' + esc(last.date) + " (" + last.open_issues + ")</text>" +
+      "</svg>"
+    );
+  }
+
+  function renderAccounting(a) {
+    var html = "";
+    html += '<div class="card"><h2>Records by Type</h2>' + chipbar(a.by_record_type) + "</div>";
+    html += '<div class="card"><h2>Amounts by Type</h2>' + chipbar(
+      Object.keys(a.amount_total_by_record_type || {}).reduce(function (acc, k) {
+        acc[k] = fmtAmount(a.amount_total_by_record_type[k]);
+        return acc;
+      }, {})
+    ) + "</div>";
+    if (a.cash_position && a.cash_position.as_of) {
+      var c = a.cash_position;
+      html += '<div class="card"><h2>Cash &amp; Bank Position (' + esc(c.as_of) + ')</h2>' + table(
+        ["Opening", "Closing", "Receipts", "Payments"],
+        [c],
+        function (r) { return [td(fmtAmount(r["Opening balance"])), td(fmtAmount(r["Closing balance"])), td(fmtAmount(r["Total receipts"])), td(fmtAmount(r["Total payments"]))]; },
+        "No cash position recorded."
+      ) + "</div>";
+    }
+    html += '<div class="card"><h2>Tax / GST Flags</h2>' + table(
+      ["Date", "Entity", "Description", "Flag", "Status"],
+      a.tax_flags,
+      function (r) { return [td(r.date), td(r.entity), td(r.description), td(r.flag), "<td>" + statusTag(r.status) + "</td>"]; },
+      "No tax/GST flags."
+    ) + "</div>";
+    html += '<div class="card"><h2>High-Priority Exceptions</h2>' + table(
+      ["Date", "Entity", "Description", "Amount", "Priority", "Recommended Action"],
+      a.high_priority_exceptions,
+      function (r) { return [td(r.date), td(r.entity), td(r.description), td(fmtAmount(r.amount)), "<td>" + pill(r.priority) + "</td>", td(r.recommended_action)]; },
+      "No high-priority accounting exceptions."
+    ) + "</div>";
+    return html;
+  }
+
+  function renderNeedsAttention(items) {
+    return table(
+      ["Source", "Date", "Item", "Detail", "Priority", "Status"],
+      items,
+      function (r) {
+        return [
+          '<td><span class="sourcebadge">' + esc(r.source) + "</span></td>",
+          td(r.date),
+          td(r.label),
+          td(r.detail),
+          "<td>" + pill(r.priority) + "</td>",
+          "<td>" + statusTag(r.status) + "</td>",
+        ];
+      },
+      "Nothing needs attention right now."
+    );
+  }
+
+  function renderRecentActivity(ra) {
+    var mon = table(
+      ["Date", "Site", "Issue", "Status"],
+      ra.monitoring,
+      function (r) { return [td(r.date), td(r.site), td(r.issue), "<td>" + statusTag(r.status) + "</td>"]; },
+      "No recent monitoring activity."
+    );
+    var acc = table(
+      ["Date", "Type", "Entity/Description", "Amount"],
+      ra.accounting,
+      function (r) { return [td(r.date), td(r.record_type), td(r.entity || r.description), td(fmtAmount(r.amount))]; },
+      "No recent accounting activity."
+    );
+    return '<div class="grid2"><div><h2>Monitoring</h2>' + mon + "</div><div><h2>Accounting</h2>" + acc + "</div></div>";
+  }
+
+  function render(data) {
+    showError("");
+    document.getElementById("updated-at").textContent =
+      "Live from Google Sheets · " + (data.overview.monitoring_row_count + data.overview.accounting_row_count) + " rows";
+
+    var root = document.getElementById("root");
+    root.classList.remove("loading");
+    root.innerHTML =
+      renderOverview(data.overview) +
+      '<div class="grid2">' +
+      "<div><h2>Monitoring</h2>" + renderMonitoring(data.monitoring) + "</div>" +
+      "<div><h2>Accounting</h2>" + renderAccounting(data.accounting) + "</div>" +
+      "</div>" +
+      '<div class="card"><h2>Needs Attention</h2>' + renderNeedsAttention(data.needs_attention) + "</div>" +
+      '<div class="card"><h2>Recent Activity</h2>' + renderRecentActivity(data.recent_activity) + "</div>";
+  }
+
+  initialize();
+})();
+</script>
+</body>
+</html>
