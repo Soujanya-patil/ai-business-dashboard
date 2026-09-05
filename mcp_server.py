@@ -230,6 +230,12 @@ def process_monitoring_summary(summary: str) -> str:
     Parsing is deterministic (no LLM call here) and tied to the fixed
     template. Re-running the same summary will not create duplicate rows.
 
+    The report date is ALWAYS extracted from the summary's own title line
+    (e.g. "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26") and
+    stored as DD.MM.YYYY - never the server's current date. If no
+    confident date can be extracted, this returns an error and writes
+    NOTHING to Google Sheets - see summary_parser.parse_monitoring_summary.
+
     After this returns, call get_business_dashboard to show the admin the
     updated dashboard reflecting what was just written.
     """
@@ -242,6 +248,19 @@ def process_monitoring_summary(summary: str) -> str:
     # ["total_open_issues"]/["issues_today_notes"]) - those are read
     # directly off `parsed` below instead, for the response text only.
     parsed = parse_monitoring_summary(summary)
+
+    # The report date must always come from the summary itself - if
+    # parse_monitoring_summary couldn't confidently extract one, stop here
+    # and write NOTHING (no rows, in any section) rather than guessing
+    # today's date for a report that might be from a different day.
+    if parsed["date"] is None:
+        return (
+            "Could not process this Monitoring summary: " + parsed["date_error"] + "\n"
+            "Please resubmit with a valid, dated Plant Monitoring Summary "
+            '(e.g. "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26"). '
+            "No rows were written to Google Sheets."
+        )
+
     rows = build_monitoring_rows(parsed)
     report_date = parsed["date"]
 

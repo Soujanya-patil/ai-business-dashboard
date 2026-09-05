@@ -105,7 +105,13 @@ DATE_FORMATS = [
     "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y",
     "%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y",
     "%d %B %Y", "%d %b %Y",
+    "%d-%b-%y", "%d-%b-%Y",
 ]
+
+# The only format ever written to Google Sheets, per the project's
+# production date-format requirement - every row's Date cell is this
+# string, never a raw datetime/date object and never ISO format.
+SHEET_DATE_FORMAT = "%d.%m.%Y"
 
 # Matches an amount with an explicit currency marker (₹, Rs, Rs., INR) -
 # deliberately does NOT match a bare number, so a count (e.g. "5 bills")
@@ -121,13 +127,22 @@ def _clean_text(text: str) -> str:
 
 
 def _parse_date(raw: str) -> str:
+    """Best-effort parse of the title-line date into DD.MM.YYYY (the only
+    format ever written to Google Sheets - see SHEET_DATE_FORMAT).
+
+    Falls back to today's date (also formatted DD.MM.YYYY) if the text
+    doesn't match a known format or there's no title line at all, since
+    every row needs a usable Date value - unlike the Monitoring parser,
+    the Day Book Summary date isn't required to be strictly validated
+    against the source text before writing.
+    """
     raw = raw.strip()
     for fmt in DATE_FORMATS:
         try:
-            return datetime.strptime(raw, fmt).date().isoformat()
+            return datetime.strptime(raw, fmt).strftime(SHEET_DATE_FORMAT)
         except ValueError:
             continue
-    return date.today().isoformat()
+    return date.today().strftime(SHEET_DATE_FORMAT)
 
 
 def _strip_bullet(line: str) -> str:
@@ -523,7 +538,7 @@ def parse_accounting_summary(summary: str) -> dict:
 
     Returns:
         {
-            "date": "YYYY-MM-DD",
+            "date": "DD.MM.YYYY",
             "issues": [{"entity","description","amount","priority","status","recommended_action"}, ...],
             "cash": {key: {"amount","raw_value"}, ...}  # only keys the report mentions
             "sales": {"invoices": {...}|None, "sales_orders": {...}|None, "receivables": {...}|None},

@@ -27,14 +27,30 @@ Determinism note: the Sheets-writing/idempotency checks generate fresh,
 uniquely-tagged content on every run (see _build_unique_summary and
 _build_unique_messy_summary) instead of reusing fixed site names and a
 fixed near-term date, and use a synthetic year (2099) so they can never be
-mistaken for, or overwrite, a real admin-submitted report.
+mistaken for, or overwrite, a real admin-submitted report. They are
+SKIPPED BY DEFAULT (see RUN_LIVE_SHEETS_TESTS below) so a normal run of
+this file never writes anything to the configured spreadsheet - set
+RUN_LIVE_SHEETS_TESTS=1 to opt in and exercise them against it.
+
+Dates: every row's Date cell is written as DD.MM.YYYY (e.g. "03.09.2026"),
+never ISO format - see summary_parser.SHEET_DATE_FORMAT. The report date
+always comes from the summary's own title line; process_monitoring_summary
+refuses to write anything and returns an error if no confident date can be
+extracted (see Tests 18-21).
 """
 
+import os
 import uuid
 
 from summary_parser import parse_monitoring_summary, build_monitoring_rows, MONITORING_HEADERS
 from mcp_server import process_monitoring_summary, service, SPREADSHEET_ID, MONITORING_TAB
 from sheets_service import get_tab_values
+
+# Sheets-writing/idempotency tests (16-17) are opt-in only - they write
+# real (if synthetically-tagged) rows to whatever spreadsheet mcp_server.py
+# is currently configured for. Default OFF so running this file never
+# populates the production spreadsheet with test data.
+RUN_LIVE_SHEETS_TESTS = os.getenv("RUN_LIVE_SHEETS_TESTS") == "1"
 
 # Exact repro of a real parsing bug: this summary was returning 0 rows for
 # every section. Root cause was the old line-by-line parser swallowing the
@@ -69,7 +85,8 @@ SERVICE PATTERN WATCH
 # (14 columns, no Section, new classified fields). This checks the parser
 # layer is still exactly right.
 EXPECTED_PARSED_BUG_SUMMARY = {
-    "date": "2026-09-02",
+    "date": "02.09.2026",
+    "date_error": None,
     "new_issues": 3,
     "resolved_issues": 2,
     "total_open_issues": 7,
@@ -105,16 +122,16 @@ EXPECTED_PARSED_BUG_SUMMARY = {
 # shortening.
 EXPECTED_BUG_SUMMARY_ROWS = {
     "needs_attention": [
-        ["2026-09-02", "Bengaluru", "Inverter failure — awaiting vendor replacement", "Inverter", "", "Open", 8, "", "", ""]
+        ["02.09.2026", "Bengaluru", "Inverter failure — awaiting vendor replacement", "Inverter", "", "Open", 8, "", "", ""]
     ],
     "actions_taken": [
-        ["2026-09-02", "Mysuru", "Panel fault", "Service", "", "Open", "", "replacement scheduled", "", ""]
+        ["02.09.2026", "Mysuru", "Panel fault", "Service", "", "Open", "", "replacement scheduled", "", ""]
     ],
     "whats_needed_next": [
-        ["2026-09-02", "", "Approval needed for expedited shipping", "", "", "Open", "", "", "Approval needed for expedited shipping", ""]
+        ["02.09.2026", "", "Approval needed for expedited shipping", "", "", "Open", "", "", "Approval needed for expedited shipping", ""]
     ],
     "service_pattern_watch": [
-        ["2026-09-02", "", "Recurring inverter failures at Bengaluru site", "Inverter", "", "Monitoring", "", "", "", ""]
+        ["02.09.2026", "", "Recurring inverter failures at Bengaluru site", "Inverter", "", "Monitoring", "", "", "", ""]
     ],
 }
 
@@ -131,7 +148,7 @@ NEEDS ATTENTION
 """
 
 EXPECTED_LONG_NARRATIVE_ROW = [
-    "2026-09-03", "079 Oaza Global Krishnagiri", "Full inverter outage + Optimizer failures",
+    "03.09.2026", "079 Oaza Global Krishnagiri", "Full inverter outage + Optimizer failures",
     "Outage", "Critical", "Open", "", "", "Priority escalation", "",
 ]
 
@@ -160,11 +177,14 @@ SERVICE PATTERN WATCH
 # unclean/free-text metrics, multi-site bullets (some with per-site values
 # in matching order), numbered What's Needed Next items, Service Pattern
 # Watch bullets with a leading bare site name (no dash) and an inline
-# multi-site mention, and qualifiers that must not be dropped. No title
-# line, on purpose - proves the parser still degrades gracefully (falls
-# back to today's date) rather than crashing or losing the rest of the
-# content when the title is missing.
-MESSY_SUMMARY = """ISSUES TODAY
+# multi-site mention, and qualifiers that must not be dropped. Uses the
+# "DD-Mon-YY" title-date style (e.g. "03-Sep-26") - a real title line is
+# required now: a missing one no longer falls back to today's date, it's
+# a hard error (see Tests 18-21) - so unlike earlier versions of this
+# fixture, this one can't omit it and still expect rows to be produced.
+MESSY_SUMMARY = """SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26
+
+ISSUES TODAY
 
 - New issues detected: Unconfirmed — can't distinguish new vs. recurring without tracker
 - Issues resolved today: Unconfirmed — need tracker to verify any issue moved to "Done at Site"
@@ -269,7 +289,7 @@ if __name__ == "__main__":
     print("=== Test 2: sections with no real data produce no rows ===")
     parsed = parse_monitoring_summary(NO_ISSUES_SUMMARY)
     print(parsed)
-    assert parsed["date"] == "2026-09-01"
+    assert parsed["date"] == "01.09.2026"
     assert parsed["needs_attention"] == [], "Expected no Needs Attention rows"
     assert parsed["actions_taken"] == [], "Expected no Actions Taken rows"
     assert parsed["whats_needed_next"] == [], "Expected no What's Needed Next rows"
@@ -449,92 +469,185 @@ if __name__ == "__main__":
         assert phrase in full_dump, f"Expected {phrase!r} to appear somewhere in the parsed output"
     print("OK: spot-checked distinctive phrases all survived somewhere in the output.\n")
 
-    print("=== Test 16: Google Sheets integration + idempotency check (clean-template style) ===")
-    run_uuid = uuid.uuid4()
-    run_id = run_uuid.hex[:10]
-    synthetic_date = f"2099-{(run_uuid.int % 12) + 1:02d}-{(run_uuid.int % 28) + 1:02d}"
-    summary_text = _build_unique_summary(run_id, synthetic_date)
-    print(f"Generated run_id={run_id!r}, synthetic date={synthetic_date!r}")
+    if not RUN_LIVE_SHEETS_TESTS:
+        print("=== Tests 16-17: Google Sheets integration + idempotency checks SKIPPED ===")
+        print("Set RUN_LIVE_SHEETS_TESTS=1 to run these against the configured production spreadsheet")
+        print("(they write real, synthetically-tagged 2099-dated rows and are opt-in on purpose).\n")
+    else:
+        print("=== Test 16: Google Sheets integration + idempotency check (clean-template style) ===")
+        run_uuid = uuid.uuid4()
+        run_id = run_uuid.hex[:10]
+        synthetic_month = (run_uuid.int % 12) + 1
+        synthetic_day = (run_uuid.int % 28) + 1
+        # ISO stays a valid INPUT format for the title line; the row
+        # actually written to Sheets must be DD.MM.YYYY - these are two
+        # different strings for the same calendar date.
+        synthetic_date_input = f"2099-{synthetic_month:02d}-{synthetic_day:02d}"
+        synthetic_date_output = f"{synthetic_day:02d}.{synthetic_month:02d}.2099"
+        summary_text = _build_unique_summary(run_id, synthetic_date_input)
+        print(f"Generated run_id={run_id!r}, synthetic date={synthetic_date_input!r} -> stored as {synthetic_date_output!r}")
 
-    result_1 = process_monitoring_summary(summary_text)
-    print(result_1)
-    assert "Needs Attention: 1 row(s)" in result_1
-    assert "Actions Taken: 1 row(s)" in result_1
-    assert "What's Needed Next: 1 row(s)" in result_1
-    assert "Service Pattern Watch: 1 row(s)" in result_1
-    assert "ALL SITES" not in result_1, "Response text must never mention an aggregate site"
-    assert "Daily Summary: updated" not in result_1, "Daily Summary is no longer written as a row"
-    assert "Daily metrics" in result_1, "Daily New Issues/Resolved/Total Open figures must still be reported back"
+        result_1 = process_monitoring_summary(summary_text)
+        print(result_1)
+        assert "Needs Attention: 1 row(s)" in result_1
+        assert "Actions Taken: 1 row(s)" in result_1
+        assert "What's Needed Next: 1 row(s)" in result_1
+        assert "Service Pattern Watch: 1 row(s)" in result_1
+        assert "ALL SITES" not in result_1, "Response text must never mention an aggregate site"
+        assert "Daily Summary: updated" not in result_1, "Daily Summary is no longer written as a row"
+        assert "Daily metrics" in result_1, "Daily New Issues/Resolved/Total Open figures must still be reported back"
 
-    all_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
-    header = all_rows[0]
-    assert header == MONITORING_HEADERS, f"Live sheet header does not match: {header}"
-    tagged_rows = [row for row in all_rows if any(run_id in str(cell) for cell in row)]
-    site_idx = MONITORING_HEADERS.index("Site")
-    for row in tagged_rows:
-        assert row[0] == synthetic_date, f"Row has wrong date: {row}"
-        assert row[site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
-            f"Found an aggregate Site value actually written to the live sheet: {row}"
+        all_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
+        header = all_rows[0]
+        assert header == MONITORING_HEADERS, f"Live sheet header does not match: {header}"
+        tagged_rows = [row for row in all_rows if any(run_id in str(cell) for cell in row)]
+        site_idx = MONITORING_HEADERS.index("Site")
+        for row in tagged_rows:
+            assert row[0] == synthetic_date_output, f"Row has wrong date (expected DD.MM.YYYY): {row}"
+            assert row[site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
+                f"Found an aggregate Site value actually written to the live sheet: {row}"
+            )
+
+        result_2 = process_monitoring_summary(summary_text)
+        print(result_2)
+        assert "Needs Attention: 0 row(s)" in result_2
+        assert "Actions Taken: 0 row(s)" in result_2
+        assert "What's Needed Next: 0 row(s)" in result_2
+        assert "Service Pattern Watch: 0 row(s)" in result_2
+
+        tagged_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB) if any(run_id in str(cell) for cell in row)]
+        assert len(tagged_rows_after) == len(tagged_rows), (
+            f"Row count for run_id={run_id!r} changed after a duplicate write: {len(tagged_rows)} -> {len(tagged_rows_after)}"
         )
+        print(f"OK: first write created {len(tagged_rows)} new rows; duplicate write created 0 more. Live header verified.\n")
 
-    result_2 = process_monitoring_summary(summary_text)
-    print(result_2)
-    assert "Needs Attention: 0 row(s)" in result_2
-    assert "Actions Taken: 0 row(s)" in result_2
-    assert "What's Needed Next: 0 row(s)" in result_2
-    assert "Service Pattern Watch: 0 row(s)" in result_2
+        print("=== Test 17: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
+        messy_run_uuid = uuid.uuid4()
+        messy_run_id = messy_run_uuid.hex[:10]
+        messy_month = (messy_run_uuid.int % 12) + 1
+        messy_day = (messy_run_uuid.int % 28) + 1
+        messy_synthetic_date_input = f"2099-{messy_month:02d}-{messy_day:02d}"
+        messy_synthetic_date_output = f"{messy_day:02d}.{messy_month:02d}.2099"
+        messy_summary_text = _build_unique_messy_summary(messy_run_id, messy_synthetic_date_input)
+        print(f"Generated run_id={messy_run_id!r}, synthetic date={messy_synthetic_date_input!r} -> stored as {messy_synthetic_date_output!r}")
 
-    tagged_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB) if any(run_id in str(cell) for cell in row)]
-    assert len(tagged_rows_after) == len(tagged_rows), (
-        f"Row count for run_id={run_id!r} changed after a duplicate write: {len(tagged_rows)} -> {len(tagged_rows_after)}"
-    )
-    print(f"OK: first write created {len(tagged_rows)} new rows; duplicate write created 0 more. Live header verified.\n")
+        messy_result_1 = process_monitoring_summary(messy_summary_text)
+        print(messy_result_1)
+        # The 2-site tripping bullet produces 2 Needs Attention rows; the
+        # 2-site inline Service Pattern Watch mention produces 2 more rows.
+        assert "Needs Attention: 2 row(s)" in messy_result_1, messy_result_1
+        assert "Actions Taken: 1 row(s)" in messy_result_1, messy_result_1
+        assert "What's Needed Next: 2 row(s)" in messy_result_1, messy_result_1
+        assert "Service Pattern Watch: 2 row(s)" in messy_result_1, messy_result_1
+        assert "ALL SITES" not in messy_result_1
+        assert "Daily metrics" in messy_result_1
+        assert "Unconfirmed" in messy_result_1, "The Unconfirmed New Issues figure must still be reported back"
 
-    print("=== Test 17: Google Sheets integration + idempotency check (messy-style, multi-row bullets) ===")
-    messy_run_uuid = uuid.uuid4()
-    messy_run_id = messy_run_uuid.hex[:10]
-    messy_synthetic_date = f"2099-{(messy_run_uuid.int % 12) + 1:02d}-{(messy_run_uuid.int % 28) + 1:02d}"
-    messy_summary_text = _build_unique_messy_summary(messy_run_id, messy_synthetic_date)
-    print(f"Generated run_id={messy_run_id!r}, synthetic date={messy_synthetic_date!r}")
+        messy_tagged_before = [
+            row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
+            if any(messy_run_id in str(cell) for cell in row)
+        ]
+        messy_site_idx = MONITORING_HEADERS.index("Site")
+        for row in messy_tagged_before:
+            assert row[0] == messy_synthetic_date_output, f"Row has wrong date (expected DD.MM.YYYY): {row}"
+            assert row[messy_site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
+                f"Found an aggregate Site value actually written to the live sheet: {row}"
+            )
 
-    messy_result_1 = process_monitoring_summary(messy_summary_text)
-    print(messy_result_1)
-    # The 2-site tripping bullet produces 2 Needs Attention rows; the
-    # 2-site inline Service Pattern Watch mention produces 2 more rows.
-    assert "Needs Attention: 2 row(s)" in messy_result_1, messy_result_1
-    assert "Actions Taken: 1 row(s)" in messy_result_1, messy_result_1
-    assert "What's Needed Next: 2 row(s)" in messy_result_1, messy_result_1
-    assert "Service Pattern Watch: 2 row(s)" in messy_result_1, messy_result_1
-    assert "ALL SITES" not in messy_result_1
-    assert "Daily metrics" in messy_result_1
-    assert "Unconfirmed" in messy_result_1, "The Unconfirmed New Issues figure must still be reported back"
+        messy_result_2 = process_monitoring_summary(messy_summary_text)
+        print(messy_result_2)
+        assert "Needs Attention: 0 row(s)" in messy_result_2, messy_result_2
+        assert "Actions Taken: 0 row(s)" in messy_result_2, messy_result_2
+        assert "What's Needed Next: 0 row(s)" in messy_result_2, messy_result_2
+        assert "Service Pattern Watch: 0 row(s)" in messy_result_2, messy_result_2
 
-    messy_tagged_before = [
-        row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
-        if any(messy_run_id in str(cell) for cell in row)
-    ]
-    messy_site_idx = MONITORING_HEADERS.index("Site")
-    for row in messy_tagged_before:
-        assert row[messy_site_idx].strip().upper() not in {"ALL SITES", "ALL", "TOTAL"}, (
-            f"Found an aggregate Site value actually written to the live sheet: {row}"
+        messy_tagged_after = [
+            row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
+            if any(messy_run_id in str(cell) for cell in row)
+        ]
+        assert len(messy_tagged_after) == len(messy_tagged_before), (
+            f"Row count changed after a duplicate write of the messy-style summary: "
+            f"{len(messy_tagged_before)} -> {len(messy_tagged_after)}"
         )
+        print(f"OK: first write created {len(messy_tagged_before)} new rows (including split multi-site rows); "
+              "duplicate write created 0 more.\n")
 
-    messy_result_2 = process_monitoring_summary(messy_summary_text)
-    print(messy_result_2)
-    assert "Needs Attention: 0 row(s)" in messy_result_2, messy_result_2
-    assert "Actions Taken: 0 row(s)" in messy_result_2, messy_result_2
-    assert "What's Needed Next: 0 row(s)" in messy_result_2, messy_result_2
-    assert "Service Pattern Watch: 0 row(s)" in messy_result_2, messy_result_2
+    print("=== Test 18: DD.MM.YYYY date format conversions ===")
+    date_format_template = """SUNTROP SOLAR — PLANT MONITORING SUMMARY | {title_date}
 
-    messy_tagged_after = [
-        row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
-        if any(messy_run_id in str(cell) for cell in row)
-    ]
-    assert len(messy_tagged_after) == len(messy_tagged_before), (
-        f"Row count changed after a duplicate write of the messy-style summary: "
-        f"{len(messy_tagged_before)} -> {len(messy_tagged_after)}"
+NEEDS ATTENTION
+- Test Site — minor issue — open 1 day — no action needed yet
+"""
+    d1 = parse_monitoring_summary(date_format_template.format(title_date="03-Sep-26"))
+    assert d1["date"] == "03.09.2026", d1["date"]
+    d2 = parse_monitoring_summary(date_format_template.format(title_date="4-Sep-26"))
+    assert d2["date"] == "04.09.2026", d2["date"]
+    print("OK: '03-Sep-26' -> '03.09.2026', '4-Sep-26' -> '04.09.2026'.\n")
+
+    print("=== Test 19: missing/unparseable report date - parser flags it, NEVER falls back to today ===")
+    no_date_summary = """SUNTROP SOLAR — PLANT MONITORING SUMMARY
+
+NEEDS ATTENTION
+- Test Site — minor issue — open 1 day — no action needed yet
+"""
+    unparseable_date_summary = """SUNTROP SOLAR — PLANT MONITORING SUMMARY | not-a-real-date
+
+NEEDS ATTENTION
+- Test Site — minor issue — open 1 day — no action needed yet
+"""
+    no_date_parsed = parse_monitoring_summary(no_date_summary)
+    assert no_date_parsed["date"] is None, no_date_parsed["date"]
+    assert no_date_parsed["date_error"], "Expected a date_error message when no date is present at all"
+
+    bad_date_parsed = parse_monitoring_summary(unparseable_date_summary)
+    assert bad_date_parsed["date"] is None, bad_date_parsed["date"]
+    assert bad_date_parsed["date_error"], "Expected a date_error message for an unparseable date"
+    print("date_error (no date):", no_date_parsed["date_error"])
+    print("date_error (bad date):", bad_date_parsed["date_error"])
+    print("OK: both come back as date=None with a clear date_error - never a silent fallback to today.\n")
+
+    print("=== Test 20: process_monitoring_summary refuses to write and returns a clear error (zero Sheets writes) ===")
+    # Safe to call for real (even against the production spreadsheet):
+    # mcp_server.process_monitoring_summary returns its error string
+    # immediately once parsed["date"] is None, BEFORE build_monitoring_rows
+    # or any append_unique_rows/Sheets call - this path never reaches the
+    # network, so no rows can possibly be written by this test.
+    result_no_date = process_monitoring_summary(no_date_summary)
+    print(result_no_date)
+    assert "Could not process this Monitoring summary" in result_no_date, result_no_date
+    assert "No rows were written" in result_no_date, result_no_date
+
+    result_bad_date = process_monitoring_summary(unparseable_date_summary)
+    print(result_bad_date)
+    assert "No rows were written" in result_bad_date, result_bad_date
+    print("OK: a clear error is returned and Google Sheets is never reached when no confident date is found.\n")
+
+    print("=== Test 21: every row generated from one summary carries THAT summary's date, not the server's current date ===")
+    from datetime import date as _date, timedelta as _timedelta
+    different_date = _date.today() - _timedelta(days=100)
+    different_date_title = different_date.strftime("%d-%b-%y")
+    expected_sheet_date = different_date.strftime("%d.%m.%Y")
+    assert expected_sheet_date != _date.today().strftime("%d.%m.%Y"), "Fixture must use a date other than today"
+    multi_row_summary = f"""SUNTROP SOLAR — PLANT MONITORING SUMMARY | {different_date_title}
+
+NEEDS ATTENTION
+- 079 Oaza Global Krishnagiri — full inverter outage — open 2 days — priority escalation required
+- 027 Ranganath Mahalakshmi Layout — repeated inverter tripping — open 1 day — service inspection needed
+
+ACTIONS TAKEN TODAY
+- 011 R P Metal Sections — replacement received — site visit scheduled
+"""
+    multi_parsed = parse_monitoring_summary(multi_row_summary)
+    assert multi_parsed["date"] == expected_sheet_date, (
+        f"Expected the row date to come from the summary ({expected_sheet_date}), got {multi_parsed['date']}"
     )
-    print(f"OK: first write created {len(messy_tagged_before)} new rows (including split multi-site rows); "
-          "duplicate write created 0 more.\n")
+    multi_rows = build_monitoring_rows(multi_parsed)
+    all_generated_rows = [row for section_rows in multi_rows.values() for row in section_rows]
+    assert len(all_generated_rows) == 3, all_generated_rows
+    date_col = MONITORING_HEADERS.index("Date")
+    for row in all_generated_rows:
+        assert row[date_col] == expected_sheet_date, f"Row did not carry the summary's own date: {row}"
+    print(f"OK: all {len(all_generated_rows)} rows generated from this summary carry its date ({expected_sheet_date}), "
+          f"not today's server date ({_date.today().strftime('%d.%m.%Y')}).\n")
 
     print("All process_monitoring_summary() tests passed.")

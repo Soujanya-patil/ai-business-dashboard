@@ -21,13 +21,27 @@ Determinism note: the Sheets-writing/idempotency check generates fresh,
 uniquely-tagged content on every run (see _build_unique_summary) and uses
 a synthetic year (2099) so it can never be mistaken for, or overwrite, a
 real admin-submitted report - same approach as test_process_summary.py.
+It is SKIPPED BY DEFAULT (see RUN_LIVE_SHEETS_TESTS below) so a normal run
+of this file never writes anything to the configured spreadsheet - set
+RUN_LIVE_SHEETS_TESTS=1 to opt in.
+
+Dates: every row's Date cell is written as DD.MM.YYYY (e.g. "03.09.2026"),
+never ISO format - see accounting_parser.SHEET_DATE_FORMAT. Unlike the
+Monitoring parser, a missing/unparseable Day Book date still falls back to
+today's date (also DD.MM.YYYY) rather than erroring - that stricter
+"never fall back, error instead" rule is Monitoring-specific.
 """
 
+import os
 import uuid
 
 from accounting_parser import parse_accounting_summary, build_accounting_rows, ACCOUNTING_HEADERS
 from mcp_server import process_accounting_summary, service, SPREADSHEET_ID, ACCOUNTING_TAB
 from sheets_service import get_tab_values
+
+# Sheets-writing/idempotency test (14) is opt-in only - see the matching
+# note in test_process_summary.py.
+RUN_LIVE_SHEETS_TESTS = os.getenv("RUN_LIVE_SHEETS_TESTS") == "1"
 
 # A clean, fully-populated Day Book summary covering every section with
 # more than one item where the template allows it (2 exceptions, 2 tax
@@ -109,7 +123,7 @@ ISSUES REQUIRING ATTENTION (if any)
 """
 
 EXPECTED_LONG_NARRATIVE_ROW = [
-    "2026-09-05", "Exception", "Micronova Impex", "Invoice inflated then reversed", 1606711,
+    "05.09.2026", "Exception", "Micronova Impex", "Invoice inflated then reversed", 1606711,
     "", "Critical", "Unconfirmed", "Confirm with CA", "ITC",
 ]
 
@@ -171,7 +185,7 @@ if __name__ == "__main__":
     print("=== Test 3: clean summary - all sections parse, multiple rows per section, all rows 10 columns ===")
     parsed = parse_accounting_summary(CLEAN_SUMMARY)
     rows = build_accounting_rows(parsed)
-    assert parsed["date"] == "2026-09-03"
+    assert parsed["date"] == "03.09.2026"
     assert len(rows["issues"]) == 2, f"Expected 2 exceptions, got {len(rows['issues'])}"
     assert len(rows["cash"]) == 4, f"Expected 4 Cash rows (opening/closing/receipts/payments), got {len(rows['cash'])}"
     assert len(rows["sales"]) == 3, f"Expected 3 Sale rows (invoices + orders + receivables), got {len(rows['sales'])}"
@@ -329,53 +343,75 @@ if __name__ == "__main__":
     print(f"Amount: {actual_long_row[ACCOUNTING_HEADERS.index('Amount')]} (bare integer, not '₹16,06,711')")
     print("OK: the full paragraph was never stored - Sheets got a concise, fully-populated row instead.\n")
 
-    print("=== Test 14: Google Sheets integration + idempotency check ===")
-    run_uuid = uuid.uuid4()
-    run_id = run_uuid.hex[:10]
-    synthetic_date = f"2099-{(run_uuid.int % 12) + 1:02d}-{(run_uuid.int % 28) + 1:02d}"
-    summary_text = _build_unique_summary(run_id, synthetic_date)
-    print(f"Generated run_id={run_id!r}, synthetic date={synthetic_date!r}")
+    if not RUN_LIVE_SHEETS_TESTS:
+        print("=== Test 14: Google Sheets integration + idempotency check SKIPPED ===")
+        print("Set RUN_LIVE_SHEETS_TESTS=1 to run this against the configured production spreadsheet")
+        print("(it writes real, synthetically-tagged 2099-dated rows and is opt-in on purpose).\n")
+    else:
+        print("=== Test 14: Google Sheets integration + idempotency check ===")
+        run_uuid = uuid.uuid4()
+        run_id = run_uuid.hex[:10]
+        synthetic_month = (run_uuid.int % 12) + 1
+        synthetic_day = (run_uuid.int % 28) + 1
+        # ISO stays a valid INPUT format for the title line; the row
+        # actually written to Sheets must be DD.MM.YYYY.
+        synthetic_date_input = f"2099-{synthetic_month:02d}-{synthetic_day:02d}"
+        synthetic_date_output = f"{synthetic_day:02d}.{synthetic_month:02d}.2099"
+        summary_text = _build_unique_summary(run_id, synthetic_date_input)
+        print(f"Generated run_id={run_id!r}, synthetic date={synthetic_date_input!r} -> stored as {synthetic_date_output!r}")
 
-    result_1 = process_accounting_summary(summary_text)
-    print(result_1)
-    assert "Cash & Bank Position: updated" in result_1
-    assert "Purchase: updated" in result_1
-    assert "Issues Requiring Attention: 1 row(s)" in result_1
-    assert "Sales: 2 row(s)" in result_1
-    assert "Expenses & Journal Entries: 1 row(s)" in result_1
-    assert "GST/Tax Watch Items: 1 row(s)" in result_1
-    assert "Pending From Yesterday: 1 row(s)" in result_1
+        result_1 = process_accounting_summary(summary_text)
+        print(result_1)
+        assert "Cash & Bank Position: updated" in result_1
+        assert "Purchase: updated" in result_1
+        assert "Issues Requiring Attention: 1 row(s)" in result_1
+        assert "Sales: 2 row(s)" in result_1
+        assert "Expenses & Journal Entries: 1 row(s)" in result_1
+        assert "GST/Tax Watch Items: 1 row(s)" in result_1
+        assert "Pending From Yesterday: 1 row(s)" in result_1
 
-    all_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
-    header = all_rows[0]
-    assert header == ACCOUNTING_HEADERS, f"Live sheet header does not match: {header}"
-    # Cash/Sales/Purchase lines in the generator don't embed run_id (their
-    # template shape leaves no room for a free-text tag without breaking
-    # amount extraction), so identify this run's rows by its unique
-    # synthetic date instead - equally reliable since a fresh date is
-    # generated every run specifically to avoid cross-run collisions.
-    date_rows = [row for row in all_rows if row[0] == synthetic_date]
-    # 1 issue + 4 cash + 2 sales + 1 purchase + 1 expense + 1 tax + 1 pending = 11
-    assert len(date_rows) == 11, f"Expected 11 rows for date {synthetic_date!r} on first write, got {len(date_rows)}"
-    tagged_rows = [row for row in date_rows if any(run_id in str(cell) for cell in row)]
-    assert len(tagged_rows) == 4, f"Expected 4 run_id-tagged rows (issue/expense/tax/pending), got {len(tagged_rows)}"
+        all_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
+        header = all_rows[0]
+        assert header == ACCOUNTING_HEADERS, f"Live sheet header does not match: {header}"
+        # Cash/Sales/Purchase lines in the generator don't embed run_id (their
+        # template shape leaves no room for a free-text tag without breaking
+        # amount extraction), so identify this run's rows by its unique
+        # synthetic date instead - equally reliable since a fresh date is
+        # generated every run specifically to avoid cross-run collisions.
+        date_rows = [row for row in all_rows if row[0] == synthetic_date_output]
+        # 1 issue + 4 cash + 2 sales + 1 purchase + 1 expense + 1 tax + 1 pending = 11
+        assert len(date_rows) == 11, f"Expected 11 rows for date {synthetic_date_output!r} on first write, got {len(date_rows)}"
+        tagged_rows = [row for row in date_rows if any(run_id in str(cell) for cell in row)]
+        assert len(tagged_rows) == 4, f"Expected 4 run_id-tagged rows (issue/expense/tax/pending), got {len(tagged_rows)}"
 
-    result_2 = process_accounting_summary(summary_text)
-    print(result_2)
-    assert "Issues Requiring Attention: 0 row(s)" in result_2
-    assert "Sales: 0 row(s)" in result_2
-    assert "Expenses & Journal Entries: 0 row(s)" in result_2
-    assert "GST/Tax Watch Items: 0 row(s)" in result_2
-    assert "Pending From Yesterday: 0 row(s)" in result_2
-    # Cash/Purchase are upserts, so they still report "updated" (in place), not a count.
-    assert "Cash & Bank Position: updated" in result_2
-    assert "Purchase: updated" in result_2
+        result_2 = process_accounting_summary(summary_text)
+        print(result_2)
+        assert "Issues Requiring Attention: 0 row(s)" in result_2
+        assert "Sales: 0 row(s)" in result_2
+        assert "Expenses & Journal Entries: 0 row(s)" in result_2
+        assert "GST/Tax Watch Items: 0 row(s)" in result_2
+        assert "Pending From Yesterday: 0 row(s)" in result_2
+        # Cash/Purchase are upserts, so they still report "updated" (in place), not a count.
+        assert "Cash & Bank Position: updated" in result_2
+        assert "Purchase: updated" in result_2
 
-    date_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB) if row[0] == synthetic_date]
-    assert len(date_rows_after) == len(date_rows), (
-        f"Row count for date {synthetic_date!r} changed after a duplicate write: {len(date_rows)} -> {len(date_rows_after)}"
-    )
-    print(f"OK: first write created {len(date_rows)} rows total (incl. 4 Cash + 1 Purchase upserts); "
-          "duplicate write created 0 additional rows, and Cash/Purchase sub-records were updated in place, not duplicated.\n")
+        date_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB) if row[0] == synthetic_date_output]
+        assert len(date_rows_after) == len(date_rows), (
+            f"Row count for date {synthetic_date_output!r} changed after a duplicate write: {len(date_rows)} -> {len(date_rows_after)}"
+        )
+        print(f"OK: first write created {len(date_rows)} rows total (incl. 4 Cash + 1 Purchase upserts); "
+              "duplicate write created 0 additional rows, and Cash/Purchase sub-records were updated in place, not duplicated.\n")
+
+    print("=== Test 15: DD.MM.YYYY date format conversion (Accounting) ===")
+    date_format_summary = """SUNTROP SOLAR — DAY BOOK SUMMARY | 03-Sep-26
+
+EXPENSES & JOURNAL ENTRIES
+- Minor stationery purchase ₹500
+"""
+    d1 = parse_accounting_summary(date_format_summary)
+    assert d1["date"] == "03.09.2026", d1["date"]
+    d2 = parse_accounting_summary(date_format_summary.replace("03-Sep-26", "4-Sep-26"))
+    assert d2["date"] == "04.09.2026", d2["date"]
+    print("OK: '03-Sep-26' -> '03.09.2026', '4-Sep-26' -> '04.09.2026'.\n")
 
     print("All process_accounting_summary() tests passed.")

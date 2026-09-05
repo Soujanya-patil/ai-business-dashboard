@@ -50,7 +50,7 @@ gracefully instead (see _block_lines' collapsed-newline recovery).
 """
 
 import re
-from datetime import date, datetime
+from datetime import datetime
 
 from text_summarizer import shorten, split_on_arrow
 
@@ -115,7 +115,14 @@ DATE_FORMATS = [
     "%b %d %Y",
     "%d %B %Y",
     "%d %b %Y",
+    "%d-%b-%y",   # e.g. "03-Sep-26"
+    "%d-%b-%Y",   # e.g. "03-Sep-2026"
 ]
+
+# The only format ever written to Google Sheets, per the project's
+# production date-format requirement - every row's Date cell is this
+# string, never a raw datetime/date object and never ISO format.
+SHEET_DATE_FORMAT = "%d.%m.%Y"
 
 # A site reference in the messy report format: a 2-5 digit code, e.g.
 # "079" in "079 Oaza Global Krishnagiri". Used only to decide whether a
@@ -131,20 +138,26 @@ def _clean_text(text: str) -> str:
     return text
 
 
-def _parse_date(raw: str) -> str:
-    """Best-effort parse of the title-line date into ISO format (YYYY-MM-DD).
+def _parse_date(raw: str):
+    """Best-effort parse of the title-line date into DD.MM.YYYY (the only
+    format ever written to Google Sheets - see SHEET_DATE_FORMAT).
 
-    Falls back to today's date if the text doesn't match a known format
-    (or there's no title line at all), since every row needs a usable
-    Date value.
+    Returns None - NEVER today's date - when `raw` is blank or doesn't
+    match any known format. The report date must always come from the
+    summary itself; silently substituting the server's current date would
+    mean a row is dated wrong with no way to tell from the sheet. The
+    caller (parse_monitoring_summary) surfaces this as an explicit error
+    instead of a fabricated date.
     """
     raw = raw.strip()
+    if not raw:
+        return None
     for fmt in DATE_FORMATS:
         try:
-            return datetime.strptime(raw, fmt).date().isoformat()
+            return datetime.strptime(raw, fmt).strftime(SHEET_DATE_FORMAT)
         except ValueError:
             continue
-    return date.today().isoformat()
+    return None
 
 
 def _split_dash(text: str) -> list:
@@ -592,7 +605,17 @@ def parse_monitoring_summary(summary: str) -> dict:
 
     Returns:
         {
-            "date": "YYYY-MM-DD",
+            "date": "DD.MM.YYYY" | None,   # None means no confident report
+                                            # date could be extracted from
+                                            # the summary - see "date_error"
+            "date_error": str | None,      # set only when "date" is None;
+                                            # a human-readable explanation.
+                                            # The caller (process_monitoring_
+                                            # summary) must refuse to write
+                                            # anything to Sheets when this is
+                                            # set - the report date always
+                                            # comes from the summary itself,
+                                            # NEVER the server's current date.
             "new_issues": int | str,       # str only for unparseable values
             "resolved_issues": int | str,  # e.g. "Unconfirmed - ..."
             "total_open_issues": int | str,
@@ -629,7 +652,10 @@ def parse_monitoring_summary(summary: str) -> dict:
     # newline or the first section header - whichever comes first. This
     # avoids swallowing the rest of the summary if there's no newline
     # after the title (e.g. embedded newlines were stripped upstream).
-    # If there's no title line at all, falls back to today's date.
+    # If there's no title line, or no date after "|", or the text there
+    # doesn't match a known format, "date" comes back as None (see
+    # _parse_date) - the caller must treat that as an error, never
+    # substitute today's date.
     report_date_raw = ""
     title_match = TITLE_RE.search(text)
     if title_match:
@@ -647,8 +673,24 @@ def parse_monitoring_summary(summary: str) -> dict:
 
     issues_today = _parse_issues_today(blocks.get("issues_today", ""))
 
+    parsed_date = _parse_date(report_date_raw)
+    if parsed_date is None:
+        if report_date_raw:
+            date_error = (
+                f"Could not confidently parse a report date from {report_date_raw!r} "
+                "in the summary's title line."
+            )
+        else:
+            date_error = (
+                "No report date found. Expected a title line like "
+                '"SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26".'
+            )
+    else:
+        date_error = None
+
     return {
-        "date": _parse_date(report_date_raw) if report_date_raw else date.today().isoformat(),
+        "date": parsed_date,
+        "date_error": date_error,
         "new_issues": issues_today["new_issues"],
         "resolved_issues": issues_today["resolved_issues"],
         "total_open_issues": issues_today["total_open_issues"],
