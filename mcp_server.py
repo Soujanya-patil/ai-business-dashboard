@@ -124,13 +124,24 @@ service = build(
 
 @apps.tool(resource_uri="ui://dashboard/app.html", visibility=["model", "app"])
 def get_business_dashboard(ctx: Context) -> CallToolResult:
-    """Compute and show the founder/CEO-level AI Business Dashboard:
-    overview KPIs (open issues, critical/high counts, sales/purchase/cash
-    totals), a Monitoring section (priority/category breakdowns, sites
-    needing attention, recent actions, next actions, an open-issues trend
-    when more than one date is present), an Accounting section (record
-    types, amounts, cash position, tax/GST flags, high-priority
-    exceptions), a cross-sheet Needs Attention list, and Recent Activity.
+    """Compute and show the owner/executive-level AI Business Dashboard -
+    "what does the owner need to know today, what needs attention, what
+    changed, and what action is required": overview KPIs (open issues,
+    critical/high counts, resolved today, sales/purchase/payments/cash
+    totals), a Needs My Attention list combining both sheets with a
+    concrete next action per item, a What Changed Today comparison against
+    the most recent PRIOR reporting date actually present in the data (not
+    the server's clock), a Patterns & Risks list of recurring/notable
+    conditions the data itself supports, a Required Actions checklist, a
+    Monitoring section (priority/category breakdowns, sites needing
+    attention, recent actions, next actions, an open-issues trend when
+    more than one date is present), an Accounting section (record types,
+    amounts, cash position, tax/GST flags, high-priority exceptions,
+    pending items), and Recent Activity. The interactive Monitoring/
+    Accounting tables show only the handful of columns an owner actually
+    scans - every raw 10-column schema field is still available by
+    clicking a row open; the underlying Sheets data and schema are
+    untouched either way.
 
     Everything is calculated FRESH from the current Monitoring and
     Accounting Google Sheets rows on every call (via the same

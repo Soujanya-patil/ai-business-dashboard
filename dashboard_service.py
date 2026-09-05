@@ -28,6 +28,11 @@ _PRIORITY_RANK = {"Critical": 0, "High": 1, "Medium": 2, "Low": 3, "": 4}
 _RECENT_LIMIT = 10
 _NEEDS_ATTENTION_LIMIT = 15
 
+# "Recurring"/"repeated" literally means "happened more than once" - this
+# is that plain definition, not an invented significance threshold. Every
+# pattern below only fires on counts/values actually present in the data.
+_RECURRING_MIN_COUNT = 2
+
 
 def _to_records(rows: list[list[str]]) -> list[dict[str, str]]:
     """Turns a get_tab_values()-shaped [header, *data_rows] list into a
@@ -332,10 +337,18 @@ def _build_needs_attention(monitoring: list[dict[str, str]], accounting: list[di
             "detail": r.get("Issue", ""),
             "priority": r.get("Priority", ""),
             "status": r.get("Status", ""),
+            # Straight from the row's own Next Action cell - blank when the
+            # sheet doesn't have one, never a made-up recommendation.
+            "action": r.get("Next Action", ""),
         })
     for r in accounting:
         if r.get("Priority") not in ("Critical", "High") and r.get("Status") != "Unconfirmed":
             continue
+        risk_flag = r.get("Risk / Tax Flag", "")
+        # Recommended Action first; if the row has none but does carry a
+        # Risk/Tax Flag, surface that flag itself as the prompt to act on -
+        # still literally present in the row, never invented wording.
+        action = r.get("Recommended Action", "") or (f"Review {risk_flag} flag" if risk_flag else "")
         items.append({
             "source": "Accounting",
             "date": r.get("Date", ""),
@@ -343,6 +356,7 @@ def _build_needs_attention(monitoring: list[dict[str, str]], accounting: list[di
             "detail": r.get("Description", ""),
             "priority": r.get("Priority", ""),
             "status": r.get("Status", ""),
+            "action": action,
         })
     items.sort(key=lambda r: (_priority_rank(r["priority"]), _date_sort_key(r["date"])))
     return items[:_NEEDS_ATTENTION_LIMIT]
@@ -382,6 +396,253 @@ def _build_recent_activity(monitoring: list[dict[str, str]], accounting: list[di
     return {"monitoring": recent_monitoring, "accounting": recent_accounting}
 
 
+# --- What Changed Today --------------------------------------------------
+def _metric_amount(records: list[dict[str, str]], date_value: str, record_type: str, descriptions: tuple[str, ...]):
+    """Sum of Amount for records matching (date, Record Type, Description
+    in `descriptions`). Returns None (never a fabricated 0) when no such
+    record exists for that date - "no record submitted" and "value is
+    zero" are different facts, and only the sheet can tell them apart.
+    """
+    matching = [
+        r for r in records
+        if r.get("Date") == date_value and r.get("Record Type") == record_type and r.get("Description") in descriptions
+    ]
+    if not matching:
+        return None
+    return _round_amount(sum(_parse_amount(r.get("Amount")) or 0 for r in matching))
+
+
+def _build_what_changed(monitoring: list[dict[str, str]], accounting: list[dict[str, str]]) -> dict[str, Any]:
+    """"Today" is never the server clock - it's whatever the MOST RECENT
+    date actually present in each sheet is (Monitoring and Accounting are
+    tracked separately since one can be updated without the other). Every
+    figure below is scoped to that date's own rows; a comparison figure
+    (sales/purchase/payments change) additionally requires a second,
+    earlier distinct date to exist - with only one date on record there is
+    nothing to compare against, so that figure is simply absent rather
+    than compared to a fabricated baseline of zero.
+    """
+    mon_dates = sorted({r["Date"] for r in monitoring if r.get("Date")}, key=_date_sort_key)
+    acc_dates = sorted({r["Date"] for r in accounting if r.get("Date")}, key=_date_sort_key)
+
+    monitoring_date = mon_dates[-1] if mon_dates else ""
+    accounting_date = acc_dates[-1] if acc_dates else ""
+
+    result: dict[str, Any] = {
+        "monitoring_date": monitoring_date,
+        "accounting_date": accounting_date,
+    }
+
+    if monitoring_date:
+        today_mon = [r for r in monitoring if r.get("Date") == monitoring_date]
+        result["new_open_issues"] = sum(1 for r in today_mon if _is_open(r.get("Status", "")))
+        result["resolved_issues"] = sum(1 for r in today_mon if r.get("Status", "").strip().lower() == "resolved")
+        # Only OPEN Critical/High rows count here - a Critical issue that
+        # was both reported and resolved the same day isn't something
+        # still needing attention today.
+        result["new_critical_high"] = sum(
+            1 for r in today_mon if r.get("Priority") in ("Critical", "High") and _is_open(r.get("Status", ""))
+        )
+
+    if accounting_date:
+        today_acc = [r for r in accounting if r.get("Date") == accounting_date]
+        result["new_accounting_exceptions"] = sum(1 for r in today_acc if r.get("Record Type") == "Exception")
+
+    if len(acc_dates) >= 2:
+        previous_date = acc_dates[-2]
+        for key, record_type, descriptions in (
+            ("sales", "Sale", ("Invoices raised", "Sales orders raised")),
+            ("purchase", "Purchase", ("Purchase bills booked",)),
+            ("payments", "Cash", ("Total payments",)),
+        ):
+            latest_value = _metric_amount(accounting, accounting_date, record_type, descriptions)
+            previous_value = _metric_amount(accounting, previous_date, record_type, descriptions)
+            if latest_value is not None and previous_value is not None:
+                result[f"{key}_change"] = {
+                    "latest": latest_value,
+                    "previous": previous_value,
+                    "previous_date": previous_date,
+                    "delta": _round_amount(latest_value - previous_value),
+                }
+
+    return result
+
+
+# --- Patterns & Risks ------------------------------------------------------
+def _add_pattern(patterns: list[dict[str, Any]], category: str, description: str, **extra: Any) -> None:
+    entry = {"category": category, "description": description}
+    entry.update(extra)
+    patterns.append(entry)
+
+
+def _build_patterns_risks(
+    monitoring: list[dict[str, str]],
+    accounting: list[dict[str, str]],
+    monitoring_section: dict[str, Any],
+    accounting_section: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Every entry here is a plain fact about the actual rows - a count
+    that is literally >=2 ("recurring"), a MAX() over an actual column
+    ("longest open", "largest transaction"), or a real increase between
+    two actual computed trend points. Nothing here is a judgment call
+    dressed up as data; there is no invented severity threshold anywhere
+    in this function.
+    """
+    patterns: list[dict[str, Any]] = []
+
+    # --- Monitoring: recurring groupings (count >= 2 is the plain
+    # definition of "recurring"/"repeated", not a chosen significance bar).
+    for site, count in Counter(r["Site"] for r in monitoring if r.get("Site")).most_common():
+        if count < _RECURRING_MIN_COUNT:
+            break
+        _add_pattern(patterns, "Recurring Site Issue", f"{site} has {count} recorded issues", count=count)
+
+    for category, count in Counter(r["Category"] for r in monitoring if r.get("Category")).most_common():
+        if count < _RECURRING_MIN_COUNT:
+            break
+        _add_pattern(patterns, "Repeated Equipment Issue", f"{category} issues recorded {count} times", count=count)
+
+    for vendor, count in Counter(r["Vendor"] for r in monitoring if r.get("Vendor")).most_common():
+        if count < _RECURRING_MIN_COUNT:
+            break
+        _add_pattern(patterns, "Vendor Pattern", f"{vendor} involved in {count} recorded issues", count=count)
+
+    # --- Monitoring: the longest currently-open issue(s) - a factual MAX,
+    # not a fixed "more than N days" cutoff.
+    open_with_days = [
+        (r, _parse_amount(r.get("Days Open")))
+        for r in monitoring
+        if _is_open(r.get("Status", ""))
+    ]
+    open_with_days = [(r, d) for r, d in open_with_days if d is not None]
+    if open_with_days:
+        max_days = max(d for _, d in open_with_days)
+        max_days_display = int(max_days) if max_days == int(max_days) else max_days
+        for r, d in open_with_days:
+            if d == max_days:
+                label = r.get("Site") or r.get("Issue") or "(unlabeled record)"
+                _add_pattern(
+                    patterns, "Long-Open Issue",
+                    f"{label} has been open {max_days_display} day(s) - the longest currently open",
+                    days_open=max_days_display,
+                )
+
+    # --- Monitoring: rising open-issue volume, straight from the same
+    # trend already computed for the chart - only the most recent step.
+    trend = monitoring_section.get("open_issues_trend") or []
+    if len(trend) >= 2 and trend[-1]["open_issues"] > trend[-2]["open_issues"]:
+        _add_pattern(
+            patterns, "Rising Open Issues",
+            f"Open issues rose from {trend[-2]['open_issues']} to {trend[-1]['open_issues']} "
+            f"between {trend[-2]['date']} and {trend[-1]['date']}",
+        )
+
+    # --- Accounting: recurring expense descriptions / repeated entities.
+    expense_counts = Counter(
+        r["Description"] for r in accounting if r.get("Record Type") == "Expense" and r.get("Description")
+    )
+    for description, count in expense_counts.most_common():
+        if count < _RECURRING_MIN_COUNT:
+            break
+        _add_pattern(patterns, "Repeated Expense", f'"{description}" recorded {count} times', count=count)
+
+    entity_counts = Counter(
+        r["Entity"] for r in accounting if r.get("Record Type") in ("Exception", "Pending") and r.get("Entity")
+    )
+    for entity, count in entity_counts.most_common():
+        if count < _RECURRING_MIN_COUNT:
+            break
+        _add_pattern(patterns, "Repeated Entity Issue", f"{entity} appears in {count} exception/pending records", count=count)
+
+    # --- Accounting: tax/risk flags, reusing the already-computed list.
+    flag_counts = Counter(t["flag"] for t in accounting_section.get("tax_flags", []) if t.get("flag"))
+    for flag, count in flag_counts.most_common():
+        _add_pattern(patterns, "Tax/Risk Flag", f"{count} record(s) flagged {flag}", count=count)
+
+    # --- Accounting: the single largest recorded transaction - a factual
+    # MAX over whatever amounts are actually present, not an arbitrary
+    # "large transaction" cutoff. Restricted to actual transaction-type
+    # records (Sale/Purchase/Expense/Exception) - a Cash balance/receipts
+    # figure is a snapshot or aggregate, not itself "a transaction".
+    _TRANSACTION_TYPES = ("Sale", "Purchase", "Expense", "Exception")
+    amounts = [(r, _parse_amount(r.get("Amount"))) for r in accounting if r.get("Record Type") in _TRANSACTION_TYPES]
+    amounts = [(r, a) for r, a in amounts if a is not None and a > 0]
+    # "Largest" only means something relative to at least one other
+    # transaction - with a single data point, calling it "the largest" is
+    # trivially true and not an actual pattern.
+    if len(amounts) >= _RECURRING_MIN_COUNT:
+        max_amount = max(a for _, a in amounts)
+        for r, a in amounts:
+            if a == max_amount:
+                label = r.get("Entity") or r.get("Description") or r.get("Record Type") or "(unlabeled record)"
+                _add_pattern(
+                    patterns, "Large Transaction",
+                    f"{label} is the largest recorded transaction",
+                    amount=_round_amount(max_amount),
+                )
+
+    # --- Accounting: pending backlog, reusing the already-computed list.
+    pending_items = accounting_section.get("pending_items", [])
+    if pending_items:
+        _add_pattern(
+            patterns, "Pending Items",
+            f"{len(pending_items)} item(s) still pending from previous reports",
+            count=len(pending_items),
+        )
+
+    return patterns
+
+
+# --- Required Actions -------------------------------------------------
+def _build_required_actions(monitoring: list[dict[str, str]], accounting: list[dict[str, str]]) -> list[dict[str, Any]]:
+    """A concise, deduplicated action list - each entry's action text comes
+    directly from that row's own Next Action / Recommended Action / Risk
+    Tax Flag cell; the only non-verbatim text is the generic "Review - X
+    priority" prompt, used only when a Critical/High record has none of
+    those fields filled in (so it still surfaces, but never with an
+    invented specific action). Closed/Resolved rows are excluded - nothing
+    to act on there regardless of what fields they carry.
+    """
+    actions: list[dict[str, Any]] = []
+
+    for r in monitoring:
+        if not _is_open(r.get("Status", "")):
+            continue
+        next_action = r.get("Next Action", "")
+        priority = r.get("Priority", "")
+        if not next_action and priority not in ("Critical", "High"):
+            continue
+        actions.append({
+            "source": "Monitoring",
+            "date": r.get("Date", ""),
+            "label": r.get("Site", "") or r.get("Issue", ""),
+            "action": next_action or f"Review — {priority} priority",
+            "priority": priority,
+            "status": r.get("Status", ""),
+        })
+
+    for r in accounting:
+        if not _is_open(r.get("Status", "")):
+            continue
+        recommended = r.get("Recommended Action", "")
+        risk_flag = r.get("Risk / Tax Flag", "")
+        priority = r.get("Priority", "")
+        if not recommended and not risk_flag and priority not in ("Critical", "High"):
+            continue
+        action_text = recommended or (f"Review {risk_flag} flag" if risk_flag else f"Review — {priority} priority")
+        actions.append({
+            "source": "Accounting",
+            "date": r.get("Date", ""),
+            "label": r.get("Entity", "") or r.get("Record Type", ""),
+            "action": action_text,
+            "priority": priority,
+            "status": r.get("Status", ""),
+        })
+
+    actions.sort(key=lambda a: (_priority_rank(a["priority"]), _date_sort_key(a["date"])))
+    return actions[:_NEEDS_ATTENTION_LIMIT]
+
+
 def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list[str]]) -> dict[str, Any]:
     """Build the full dashboard payload from raw Monitoring/Accounting
     sheet data (each including its header row, exactly as
@@ -394,6 +655,9 @@ def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list
             "accounting": {...},
             "needs_attention": [...],
             "recent_activity": {"monitoring": [...], "accounting": [...]},
+            "what_changed": {...},
+            "patterns_risks": [...],
+            "required_actions": [...],
         }
 
     An empty tab (no data rows) produces zeroed/empty sections, never a
@@ -406,6 +670,16 @@ def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list
     accounting_section = _build_accounting(accounting)
     needs_attention = _build_needs_attention(monitoring, accounting)
     recent_activity = _build_recent_activity(monitoring, accounting)
+    what_changed = _build_what_changed(monitoring, accounting)
+    patterns_risks = _build_patterns_risks(monitoring, accounting, monitoring_section, accounting_section)
+    required_actions = _build_required_actions(monitoring, accounting)
+
+    # "Total payments" already exists per-cell inside cash_position (a raw
+    # sheet string, for the most recent Cash date) - this is that same
+    # figure, just parsed to a number and promoted to a top-level Executive
+    # Overview KPI. None (not 0) when there's no Cash data to read it from.
+    _payments_raw = _parse_amount((accounting_section.get("cash_position") or {}).get("Total payments"))
+    payments_total = _round_amount(_payments_raw) if _payments_raw is not None else None
 
     overview = {
         "total_open_issues": monitoring_section["total_open_issues"],
@@ -413,9 +687,15 @@ def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list
             monitoring_section["critical_high_count"]
             + sum(1 for r in accounting_section["high_priority_exceptions"] if r["priority"] in ("Critical", "High"))
         ),
+        # None (not 0) when Monitoring has no dated rows at all, i.e. there
+        # is no "today" to have resolved anything on - same underlying
+        # count _build_what_changed already computed, just also promoted
+        # to the top-level KPI strip.
+        "resolved_today": what_changed.get("resolved_issues"),
         "accounting_exceptions": accounting_section["by_record_type"].get("Exception", 0),
         "sales_total": accounting_section["sales_total"],
         "purchase_total": accounting_section["purchase_total"],
+        "payments_total": payments_total,
         "outstanding_receivables_total": accounting_section["outstanding_receivables_total"],
         "cash_position": accounting_section["cash_position"],
         "needs_attention_count": len(needs_attention),
@@ -429,4 +709,7 @@ def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list
         "accounting": accounting_section,
         "needs_attention": needs_attention,
         "recent_activity": recent_activity,
+        "what_changed": what_changed,
+        "patterns_risks": patterns_risks,
+        "required_actions": required_actions,
     }

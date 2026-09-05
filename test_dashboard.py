@@ -44,6 +44,21 @@ switching, filter/sort/click, both with an empty and a populated dataset)
 was additionally verified with a one-off jsdom-based render harness run
 outside this suite (jsdom is not a project dependency and is not required
 to run these tests).
+
+Owner-level dashboard (Tests 26-37): "today" is always the most recent
+DATE ACTUALLY PRESENT in each sheet's own rows, never the server clock -
+_build_what_changed derives Monitoring's and Accounting's "today" dates
+independently (they can differ) and only computes a sales/purchase/
+payments comparison when a second, earlier distinct Accounting date also
+exists to compare against. Patterns & Risks and Required Actions are
+built entirely from real counts/values already in the rows (a MAX() for
+"longest open"/"largest transaction", a literal >=2 for "recurring") -
+never an invented severity threshold. The owner-view tables in
+dashboard_app.html show only 5-6 of the 10 raw columns; the full 10 remain
+one click away via the existing detail panel, and the underlying Sheet
+schema is completely unaffected (see Test 33, which checks the HTML source
+for both the reduced table columns and the still-present full detail
+fields).
 """
 
 import asyncio
@@ -86,7 +101,10 @@ SYNTHETIC_ACCOUNTING = [ACC_HEADER] + [
 if __name__ == "__main__":
     print("=== Test 1: build_dashboard() returns the expected top-level shape ===")
     dashboard = build_dashboard(SYNTHETIC_MONITORING, SYNTHETIC_ACCOUNTING)
-    assert set(dashboard.keys()) == {"overview", "monitoring", "accounting", "needs_attention", "recent_activity"}
+    assert set(dashboard.keys()) == {
+        "overview", "monitoring", "accounting", "needs_attention", "recent_activity",
+        "what_changed", "patterns_risks", "required_actions",
+    }
     print("OK\n")
 
     print("=== Test 2: Monitoring open-issue counting excludes Resolved, includes Unconfirmed ===")
@@ -330,5 +348,162 @@ if __name__ == "__main__":
     assert empty_dashboard["accounting"]["records"] == []
     assert empty_dashboard["accounting"]["pending_items"] == []
     print("OK\n")
+
+    print("=== Test 26: Needs Attention items carry an 'action' field straight from Next/Recommended Action ===")
+    mon_attn = next(item for item in na if item["source"] == "Monitoring")
+    assert mon_attn["action"] == "Priority escalation", mon_attn  # Site A's Next Action cell, verbatim
+    acc_attn = next(item for item in na if item["source"] == "Accounting")
+    assert acc_attn["action"] == "Verify with vendor", acc_attn  # ABC Traders' Recommended Action cell, verbatim
+    # A row with a Risk/Tax Flag but no Recommended Action falls back to
+    # naming that flag - still literally present in the row, not invented.
+    flag_only_dashboard = build_dashboard(
+        [MON_HEADER],
+        [ACC_HEADER, ["01.09.2026", "Exception", "Flagged Co", "Mismatch found", "9000", "", "High", "Open", "", "GST"]],
+    )
+    flag_attn = flag_only_dashboard["needs_attention"][0]
+    assert flag_attn["action"] == "Review GST flag", flag_attn
+    print("OK: needs-attention action text always comes from an actual cell (Next Action, Recommended Action, or Risk/Tax Flag).\n")
+
+    print("=== Test 27: overview 'resolved_today' and 'payments_total' ===")
+    assert o["resolved_today"] == 1, o["resolved_today"]  # the one row dated 02.09.2026 with Status=Resolved
+    # SYNTHETIC_ACCOUNTING's latest Cash date (02.09.2026) has no "Total
+    # payments" row at all - must be None, never a fabricated 0.
+    assert o["payments_total"] is None, o["payments_total"]
+    payments_dashboard = build_dashboard(
+        [MON_HEADER],
+        [ACC_HEADER, ["01.09.2026", "Cash", "", "Total payments", "45000", "", "", "", "", ""]],
+    )
+    assert payments_dashboard["overview"]["payments_total"] == 45000, payments_dashboard["overview"]["payments_total"]
+    no_monitoring_dates_dashboard = build_dashboard([MON_HEADER], [ACC_HEADER])
+    assert no_monitoring_dates_dashboard["overview"]["resolved_today"] is None, (
+        "No dated Monitoring rows at all -> resolved_today must be None, not a fabricated 0"
+    )
+    print("OK: resolved_today/payments_total are real computed values, or None when the data can't support them.\n")
+
+    print("=== Test 28: What Changed Today, computed against SYNTHETIC data ===")
+    wc = dashboard["what_changed"]
+    assert wc["monitoring_date"] == "02.09.2026" and wc["accounting_date"] == "02.09.2026", wc
+    assert wc["new_open_issues"] == 2, wc  # Site C (Unconfirmed) + Site D (Open), both dated 02.09.2026
+    assert wc["resolved_issues"] == 1, wc
+    # Site A's Critical row dated 02.09.2026 is Resolved same-day - must
+    # NOT count as a new Critical/High still needing attention.
+    assert wc["new_critical_high"] == 0, wc
+    assert wc["new_accounting_exceptions"] == 0, wc  # the one Exception is dated 01.09.2026, not "today"
+    # The latest Accounting date (02.09.2026) has no Sale/Purchase/Total-
+    # payments row at all, so none of these comparisons can be computed -
+    # they must be absent, never compared against a fabricated 0.
+    assert "sales_change" not in wc, wc
+    assert "purchase_change" not in wc, wc
+    assert "payments_change" not in wc, wc
+    print("OK: every What Changed figure matches a hand count of the actual rows; missing comparisons stay absent.\n")
+
+    print("=== Test 29: What Changed Today correctly computes a real sales/purchase/payments delta across two dates ===")
+    delta_accounting = [ACC_HEADER] + [
+        ["01.09.2026", "Sale", "", "Invoices raised", "50000", "3", "", "", "", ""],
+        ["01.09.2026", "Purchase", "", "Purchase bills booked", "20000", "2", "", "", "", ""],
+        ["01.09.2026", "Cash", "", "Total payments", "15000", "", "", "", "", ""],
+        ["02.09.2026", "Sale", "", "Invoices raised", "80000", "4", "", "", "", ""],
+        ["02.09.2026", "Purchase", "", "Purchase bills booked", "5000", "1", "", "", "", ""],
+        ["02.09.2026", "Cash", "", "Total payments", "15000", "", "", "", "", ""],
+    ]
+    delta_dashboard = build_dashboard([MON_HEADER], delta_accounting)
+    delta_wc = delta_dashboard["what_changed"]
+    assert delta_wc["sales_change"] == {"latest": 80000, "previous": 50000, "previous_date": "01.09.2026", "delta": 30000}, delta_wc
+    assert delta_wc["purchase_change"] == {"latest": 5000, "previous": 20000, "previous_date": "01.09.2026", "delta": -15000}, delta_wc
+    assert delta_wc["payments_change"] == {"latest": 15000, "previous": 15000, "previous_date": "01.09.2026", "delta": 0}, delta_wc
+    print("OK: sales/purchase/payments deltas are exact (increase, decrease, and no-change all computed correctly).\n")
+
+    print("=== Test 30: with only ONE distinct date, today's figures still compute but NO comparison is fabricated ===")
+    one_date_dashboard = build_dashboard(
+        [MON_HEADER, ["01.09.2026", "Site A", "Issue", "Outage", "Critical", "Open", "1", "", "", ""]],
+        [ACC_HEADER, ["01.09.2026", "Sale", "", "Invoices raised", "10000", "1", "", "", "", ""]],
+    )
+    one_wc = one_date_dashboard["what_changed"]
+    assert one_wc["monitoring_date"] == "01.09.2026" and one_wc["new_open_issues"] == 1, one_wc
+    assert "sales_change" not in one_wc, "A single date has nothing to compare against - must not invent a baseline"
+
+    print("=== Test 31: with NO dated rows at all, What Changed degrades to an honest empty state ===")
+    no_data_wc = build_dashboard([MON_HEADER], [ACC_HEADER])["what_changed"]
+    assert no_data_wc == {"monitoring_date": "", "accounting_date": ""}, no_data_wc
+    print("OK: single-date and zero-date cases never fabricate a comparison.\n")
+
+    print("=== Test 32: Patterns & Risks surfaces only what the SYNTHETIC data actually supports ===")
+    patterns = dashboard["patterns_risks"]
+    by_category = {}
+    for p in patterns:
+        by_category.setdefault(p["category"], []).append(p)
+    assert any("Site A has 2 recorded issues" in p["description"] for p in by_category.get("Recurring Site Issue", [])), patterns
+    assert any("Outage issues recorded 2 times" in p["description"] for p in by_category.get("Repeated Equipment Issue", [])), patterns
+    assert any("Site A" in p["description"] and p.get("days_open") == 3 for p in by_category.get("Long-Open Issue", [])), patterns
+    flags_seen = {p["description"] for p in by_category.get("Tax/Risk Flag", [])}
+    assert any("GST" in d for d in flags_seen) and any("ITC" in d for d in flags_seen), patterns
+    large_txn = by_category.get("Large Transaction", [])
+    assert large_txn and large_txn[0]["amount"] == 50000, large_txn  # the 50000 Sale, not a 120000 Cash balance row
+    # The trend is flat (2 open issues both dates) for this fixture - must
+    # NOT claim a rise that didn't happen.
+    assert "Rising Open Issues" not in by_category, patterns
+    print("OK: recurring site/category, longest-open, tax flags, and the largest actual transaction all match by hand.\n")
+
+    print("=== Test 33: Patterns & Risks flags a real rising trend, and is empty when nothing qualifies ===")
+    rising_monitoring = [MON_HEADER] + [
+        ["01.09.2026", "Site A", "Issue", "Outage", "Critical", "Open", "1", "", "", ""],
+        ["02.09.2026", "Site B", "Issue", "Outage", "Critical", "Open", "1", "", "", ""],
+        ["02.09.2026", "Site C", "Issue", "Outage", "Critical", "Open", "1", "", "", ""],
+    ]
+    rising_patterns = build_dashboard(rising_monitoring, [ACC_HEADER])["patterns_risks"]
+    assert any(p["category"] == "Rising Open Issues" for p in rising_patterns), rising_patterns
+
+    quiet_dashboard = build_dashboard(
+        [MON_HEADER, ["01.09.2026", "Site A", "Issue", "Outage", "Critical", "Open", "", "", "", ""]],
+        [ACC_HEADER, ["01.09.2026", "Sale", "", "Invoices raised", "1000", "1", "", "", "", ""]],
+    )
+    assert quiet_dashboard["patterns_risks"] == [], (
+        f"A single site/category/no-flags/no-repeats dataset must produce no patterns, got: {quiet_dashboard['patterns_risks']}"
+    )
+    print("OK: a real 2-step rise is caught; a dataset with nothing recurring/notable produces an empty list.\n")
+
+    print("=== Test 34: Required Actions is built only from real Next/Recommended Action or Critical/High rows ===")
+    ra_list = dashboard["required_actions"]
+    by_label = {a["label"]: a for a in ra_list}
+    assert by_label["Site A"]["action"] == "Priority escalation", by_label["Site A"]
+    assert by_label["Site B"]["action"] == "Review — High priority", by_label["Site B"]  # High, no Next Action of its own
+    assert by_label["Site D"]["action"] == "Verify details", by_label["Site D"]  # Low priority, but has a Next Action
+    assert by_label["ABC Traders"]["action"] == "Verify with vendor", by_label["ABC Traders"]
+    assert by_label["XYZ Ltd"]["action"] == "Confirm with CA", by_label["XYZ Ltd"]
+    # The Resolved Site A row and every blank-everything Cash/Sale/Purchase
+    # row must NOT appear - nothing to act on there.
+    assert sum(1 for a in ra_list if a["label"] == "Site A") == 1, "The Resolved Site A row must not also appear"
+    assert ra_list[0]["priority"] == "Critical", "Critical items must sort first"
+    print(f"OK: required_actions has exactly the {len(ra_list)} rows with a real action signal, correctly sorted.\n")
+
+    print("=== Test 35: dashboard_app.html shows the reduced owner-view columns, but the full 10 remain in the detail view ===")
+    for owner_column in ("Next Action", "Recommended Action"):
+        assert owner_column in html_text
+    # Fields deliberately moved OUT of the main tables must still exist
+    # somewhere in the page (the detail-panel column lists) - the raw
+    # 10-column data is never dropped, just not shown up front.
+    for detail_only_field in ("Days Open", "Action Taken", "Vendor", "Record Type", "Risk / Tax Flag"):
+        assert detail_only_field in html_text, f"{detail_only_field!r} must still be available in the row-detail view"
+    assert "MON_TABLE_COLUMNS" in html_text and "MON_DETAIL_COLUMNS" in html_text
+    assert "ACC_TABLE_COLUMNS" in html_text and "ACC_DETAIL_COLUMNS" in html_text
+    print("OK: owner-view tables and full detail views both present in the HTML; no raw column was dropped entirely.\n")
+
+    print("=== Test 36: dashboard_app.html references all 5 new/renamed Overview sections ===")
+    for heading in ("Needs My Attention", "What Changed Today", "Patterns", "Required Actions"):
+        assert heading in html_text, f"Expected the {heading!r} section heading in the HTML"
+    print("OK\n")
+
+    print("=== Test 37: latest-date logic is per-sheet and never touches the server clock ===")
+    import datetime as _datetime
+    # A fixture dated far from any real "today" the test could ever run on
+    # - if this ever depended on the server clock, monitoring_date would
+    # not equal the fixture's own date.
+    far_past_dashboard = build_dashboard(
+        [MON_HEADER, ["15.03.2019", "Site A", "Issue", "Outage", "Critical", "Open", "1", "", "", ""]],
+        [ACC_HEADER],
+    )
+    assert far_past_dashboard["what_changed"]["monitoring_date"] == "15.03.2019"
+    assert far_past_dashboard["what_changed"]["monitoring_date"] != _datetime.date.today().strftime("%d.%m.%Y")
+    print("OK: 'today' is read from the sheet's own dates, confirmed against a date nowhere near the real current date.\n")
 
     print("All dashboard tests passed.")

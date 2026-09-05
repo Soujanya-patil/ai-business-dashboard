@@ -101,6 +101,13 @@
   .detail-value { font-size: 12px; }
   .resultcount { color: var(--text-muted); margin-top: 8px; }
 
+  .attention-list { display: flex; flex-direction: column; gap: 8px; }
+  .attention-card { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--bg); }
+  .attention-head { margin-bottom: 4px; }
+  .attention-detail { font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+  .attention-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .attention-action { font-size: 11px; color: var(--accent); font-weight: 600; }
+
   #root.loading { opacity: .5; }
   #error { color: var(--critical); padding: 8px 0; display: none; }
 </style>
@@ -359,6 +366,14 @@
     );
   }
 
+  // Present (not null/undefined) is the test for whether a KPI derived
+  // from "today"/"the latest date" is shown at all - a real computed 0 is
+  // still shown (e.g. "Resolved Today: 0"), only genuinely absent data
+  // (no dated rows to compute from) omits the card entirely.
+  function isKnown(v) {
+    return v !== null && v !== undefined;
+  }
+
   function renderOverview(o) {
     var cash = o.cash_position || {};
     var cashClosing = cash["Closing balance"];
@@ -366,10 +381,12 @@
       '<div class="kpis">' +
       kpi(o.total_open_issues, "Open Issues") +
       kpi(o.critical_high_issues, "Critical / High") +
-      kpi(o.needs_attention_count, "Needs Attention") +
+      (isKnown(o.resolved_today) ? kpi(o.resolved_today, "Resolved Today") : "") +
+      kpi(o.needs_attention_count, "Total Attention Items") +
       kpi(o.accounting_exceptions, "Accounting Exceptions") +
-      kpi(fmtAmount(o.sales_total), "Sales Total") +
-      kpi(fmtAmount(o.purchase_total), "Purchase Total") +
+      kpi(fmtAmount(o.sales_total), "Sales") +
+      kpi(fmtAmount(o.purchase_total), "Purchases") +
+      (isKnown(o.payments_total) ? kpi(fmtAmount(o.payments_total), "Payments") : "") +
       (o.outstanding_receivables_total ? kpi(fmtAmount(o.outstanding_receivables_total), "Outstanding Receivables") : "") +
       (cashClosing ? kpi(fmtAmount(cashClosing), "Cash Balance (" + esc(cash.as_of || "") + ")") : "") +
       "</div>"
@@ -431,21 +448,97 @@
     );
   }
 
+  // WHAT (label/detail) / Priority+Status / ACTION - one glanceable card
+  // per item instead of a dense table, per the owner-view brief. Every
+  // field here is read straight off the item the server already built
+  // (see dashboard_service._build_needs_attention) - nothing is composed
+  // or inferred in this function.
   function renderNeedsAttention(items) {
+    if (!items || items.length === 0) {
+      return '<div class="empty">Nothing needs attention right now.</div>';
+    }
+    return (
+      '<div class="attention-list">' +
+      items.map(function (r) {
+        return (
+          '<div class="attention-card">' +
+          '<div class="attention-head"><span class="sourcebadge">' + esc(r.source) + "</span> <b>" + esc(r.label) + "</b></div>" +
+          (r.detail ? '<div class="attention-detail">' + esc(r.detail) + "</div>" : "") +
+          '<div class="attention-meta">' +
+          pill(r.priority) + statusTag(r.status) +
+          (r.action ? '<span class="attention-action">Action: ' + esc(r.action) + "</span>" : "") +
+          "</div>" +
+          "</div>"
+        );
+      }).join("") +
+      "</div>"
+    );
+  }
+
+  // ---- What Changed Today / Patterns & Risks / Required Actions -----------
+  function fmtChange(change) {
+    if (!change) return "";
+    var sign = change.delta > 0 ? "+" : "";
+    return fmtAmount(change.latest) + " (" + sign + fmtAmount(change.delta) + " vs " + esc(change.previous_date) + ")";
+  }
+
+  function renderWhatChanged(wc) {
+    if (!wc || (!wc.monitoring_date && !wc.accounting_date)) {
+      return '<div class="empty">Not enough dated data yet to show what changed.</div>';
+    }
+    var chips = [];
+    if (wc.monitoring_date) {
+      chips.push(["Monitoring as of", wc.monitoring_date]);
+      chips.push(["New / Open Issues Today", wc.new_open_issues]);
+      chips.push(["Resolved Today", wc.resolved_issues]);
+      chips.push(["New Critical / High Today", wc.new_critical_high]);
+    }
+    if (wc.accounting_date) {
+      chips.push(["Accounting as of", wc.accounting_date]);
+      chips.push(["New Exceptions Today", wc.new_accounting_exceptions]);
+    }
+    var html = '<div class="chipbar">' + chips.map(function (c) {
+      return '<div class="chip"><b>' + esc(c[1]) + "</b> " + esc(c[0]) + "</div>";
+    }).join("") + "</div>";
+
+    var changeLines = [];
+    if (wc.sales_change) changeLines.push(["Sales", wc.sales_change]);
+    if (wc.purchase_change) changeLines.push(["Purchases", wc.purchase_change]);
+    if (wc.payments_change) changeLines.push(["Payments", wc.payments_change]);
+    if (changeLines.length) {
+      html += '<div class="chipbar" style="margin-top:8px;">' + changeLines.map(function (c) {
+        return '<div class="chip"><b>' + esc(c[0]) + ":</b> " + esc(fmtChange(c[1])) + "</div>";
+      }).join("") + "</div>";
+    }
+    return html;
+  }
+
+  function renderPatterns(patterns) {
+    if (!patterns || patterns.length === 0) {
+      return '<div class="empty">No recurring patterns or risks identified from the current data.</div>';
+    }
     return table(
-      ["Source", "Date", "Item", "Detail", "Priority", "Status"],
-      items,
+      ["Pattern", "Details"],
+      patterns,
+      function (p) { return ['<td><span class="sourcebadge">' + esc(p.category) + "</span></td>", td(p.description)]; },
+      "No recurring patterns or risks identified from the current data."
+    );
+  }
+
+  function renderRequiredActions(actions) {
+    return table(
+      ["Source", "Item", "Action", "Priority", "Status"],
+      actions,
       function (r) {
         return [
           '<td><span class="sourcebadge">' + esc(r.source) + "</span></td>",
-          td(r.date),
           td(r.label),
-          td(r.detail),
+          td(r.action),
           "<td>" + pill(r.priority) + "</td>",
           "<td>" + statusTag(r.status) + "</td>",
         ];
       },
-      "Nothing needs attention right now."
+      "No outstanding actions right now."
     );
   }
 
@@ -468,14 +561,25 @@
   function renderOverviewTab(data) {
     return (
       renderOverview(data.overview) +
+      '<div class="card"><h2>Needs My Attention</h2>' + renderNeedsAttention(data.needs_attention) + "</div>" +
+      '<div class="card"><h2>What Changed Today</h2>' + renderWhatChanged(data.what_changed) + "</div>" +
+      '<div class="card"><h2>Patterns &amp; Risks</h2>' + renderPatterns(data.patterns_risks) + "</div>" +
+      '<div class="card"><h2>Required Actions</h2>' + renderRequiredActions(data.required_actions) + "</div>" +
       '<div class="grid2">' + renderMonitoringSnapshot(data.monitoring) + renderAccountingSnapshot(data.accounting) + "</div>" +
-      '<div class="card"><h2>Priority &amp; Attention</h2>' + renderNeedsAttention(data.needs_attention) + "</div>" +
       '<div class="card"><h2>Recent Activity</h2>' + renderRecentActivity(data.recent_activity) + "</div>"
     );
   }
 
   // ---- Monitoring tab: filter + sort + click-to-inspect -------------------
-  var MON_COLUMNS = [
+  // Owner view: the main table shows only the 5 columns a founder actually
+  // scans (Site/Issue/Priority/Status/Next Action) - MON_DETAIL_COLUMNS
+  // still carries all 10 raw schema fields, shown in full when a row is
+  // clicked open. The underlying Sheet row/schema is untouched either way;
+  // this is purely which fields this view surfaces up front.
+  var MON_TABLE_COLUMNS = [
+    ["site", "Site"], ["issue", "Issue"], ["priority", "Priority"], ["status", "Status"], ["next_action", "Next Action"],
+  ];
+  var MON_DETAIL_COLUMNS = [
     ["date", "Date"], ["site", "Site"], ["issue", "Issue"], ["category", "Category"],
     ["priority", "Priority"], ["status", "Status"], ["days_open", "Days Open"],
     ["action_taken", "Action Taken"], ["next_action", "Next Action"], ["vendor", "Vendor"],
@@ -504,7 +608,7 @@
   function renderMonDetail(r) {
     return (
       '<div class="detail-grid">' +
-      MON_COLUMNS.map(function (c) {
+      MON_DETAIL_COLUMNS.map(function (c) {
         return (
           '<div class="detail-field"><span class="detail-label">' + esc(c[1]) +
           '</span><span class="detail-value">' + esc(r[c[0]] || "—") + "</span></div>"
@@ -530,23 +634,23 @@
     var filtered = applyFilters(m.records, state.monFilters);
     var sorted = sortRecords(filtered, state.monSort, monComparator(state.monSort.col));
 
-    var head = "<tr>" + MON_COLUMNS.map(function (c) {
+    var head = "<tr>" + MON_TABLE_COLUMNS.map(function (c) {
       return '<th class="sortable" data-sort-col="' + c[0] + '">' + esc(c[1]) + sortIndicator(c[0], state.monSort) + "</th>";
     }).join("") + "</tr>";
 
     var body;
     if (sorted.length === 0) {
-      body = '<tr><td colspan="' + MON_COLUMNS.length + '" class="empty">No monitoring records match the selected filters.</td></tr>';
+      body = '<tr><td colspan="' + MON_TABLE_COLUMNS.length + '" class="empty">No monitoring records match the selected filters.</td></tr>';
     } else {
       body = sorted.map(function (r, i) {
         var row =
           '<tr class="clickable-row" data-row-idx="' + i + '">' +
-          td(r.date) + td(r.site) + td(r.issue) + td(r.category) +
+          td(r.site) + td(r.issue) +
           "<td>" + pill(r.priority) + "</td>" + "<td>" + statusTag(r.status) + "</td>" +
-          td(r.days_open) + td(r.action_taken) + td(r.next_action) + td(r.vendor) +
+          td(r.next_action) +
           "</tr>";
         if (state.monExpanded === i) {
-          row += '<tr class="detail-row"><td colspan="' + MON_COLUMNS.length + '">' + renderMonDetail(r) + "</td></tr>";
+          row += '<tr class="detail-row"><td colspan="' + MON_TABLE_COLUMNS.length + '">' + renderMonDetail(r) + "</td></tr>";
         }
         return row;
       }).join("");
@@ -560,7 +664,14 @@
   }
 
   // ---- Accounting tab: filter + sort + click-to-inspect --------------------
-  var ACC_COLUMNS = [
+  // Same owner-view split as Monitoring: main table shows only the 6
+  // decision-relevant columns; ACC_DETAIL_COLUMNS (all 10 raw schema
+  // fields) is shown in full on click. Sheet schema is untouched.
+  var ACC_TABLE_COLUMNS = [
+    ["entity", "Entity"], ["description", "Description"], ["amount", "Amount"],
+    ["priority", "Priority"], ["status", "Status"], ["recommended_action", "Recommended Action"],
+  ];
+  var ACC_DETAIL_COLUMNS = [
     ["date", "Date"], ["record_type", "Record Type"], ["entity", "Entity"], ["description", "Description"],
     ["amount", "Amount"], ["count", "Count"], ["priority", "Priority"], ["status", "Status"],
     ["recommended_action", "Recommended Action"], ["risk_tax_flag", "Risk / Tax Flag"],
@@ -576,7 +687,7 @@
   function renderAccDetail(r) {
     return (
       '<div class="detail-grid">' +
-      ACC_COLUMNS.map(function (c) {
+      ACC_DETAIL_COLUMNS.map(function (c) {
         var v = c[0] === "amount" ? fmtAmount(r[c[0]]) : (r[c[0]] || "—");
         return (
           '<div class="detail-field"><span class="detail-label">' + esc(c[1]) +
@@ -603,23 +714,23 @@
     var filtered = applyFilters(a.records, state.accFilters);
     var sorted = sortRecords(filtered, state.accSort, accComparator(state.accSort.col));
 
-    var head = "<tr>" + ACC_COLUMNS.map(function (c) {
+    var head = "<tr>" + ACC_TABLE_COLUMNS.map(function (c) {
       return '<th class="sortable" data-sort-col="' + c[0] + '">' + esc(c[1]) + sortIndicator(c[0], state.accSort) + "</th>";
     }).join("") + "</tr>";
 
     var body;
     if (sorted.length === 0) {
-      body = '<tr><td colspan="' + ACC_COLUMNS.length + '" class="empty">No accounting records match the selected filters.</td></tr>';
+      body = '<tr><td colspan="' + ACC_TABLE_COLUMNS.length + '" class="empty">No accounting records match the selected filters.</td></tr>';
     } else {
       body = sorted.map(function (r, i) {
         var row =
           '<tr class="clickable-row" data-row-idx="' + i + '">' +
-          td(r.date) + td(r.record_type) + td(r.entity) + td(r.description) +
-          td(fmtAmount(r.amount)) + td(r.count) + "<td>" + pill(r.priority) + "</td>" +
-          "<td>" + statusTag(r.status) + "</td>" + td(r.recommended_action) + td(r.risk_tax_flag) +
+          td(r.entity) + td(r.description) + td(fmtAmount(r.amount)) +
+          "<td>" + pill(r.priority) + "</td>" + "<td>" + statusTag(r.status) + "</td>" +
+          td(r.recommended_action) +
           "</tr>";
         if (state.accExpanded === i) {
-          row += '<tr class="detail-row"><td colspan="' + ACC_COLUMNS.length + '">' + renderAccDetail(r) + "</td></tr>";
+          row += '<tr class="detail-row"><td colspan="' + ACC_TABLE_COLUMNS.length + '">' + renderAccDetail(r) + "</td></tr>";
         }
         return row;
       }).join("");
