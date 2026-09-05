@@ -1,10 +1,9 @@
 import os
-from datetime import date
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.context import Context
-from mcp.server.apps import Apps, client_supports_apps
+from mcp.server.apps import Apps
 from mcp_types import CallToolResult, TextContent
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -25,9 +24,9 @@ from auth_middleware import BearerTokenMiddleware
 # defined below) and a `ui://` HTML resource. It never touches how
 # test_connection/process_monitoring_summary/process_accounting_summary
 # are registered or called, so nothing here can regress them. A client
-# that hasn't negotiated Apps support (checked via client_supports_apps())
-# still gets the same dashboard tool - it just receives the computed
-# summary as plain text instead of the interactive iframe.
+# that hasn't negotiated Apps support still gets the same dashboard tool
+# and the same fixed text response - it just doesn't render the
+# interactive iframe alongside it.
 apps = Apps()
 _DASHBOARD_HTML = (Path(__file__).parent / "dashboard_app.html").read_text(encoding="utf-8")
 apps.add_html_resource(
@@ -123,119 +122,203 @@ service = build(
 # the top of the file, after `service`/SPREADSHEET_ID/MONITORING_TAB/
 # ACCOUNTING_TAB exist for this tool's body to use.
 
-def _dashboard_summary_lines(dashboard: dict, apps_supported: bool, today_str: str) -> list:
-    """Builds get_business_dashboard's plain-text response as a pure
-    function of already-computed data (no Sheets access, no ctx) - kept
-    separate from the tool function itself purely so this text-composition
-    logic can be unit tested directly; get_business_dashboard needs a
-    live MCP request context (for client_supports_apps) that a test can't
-    construct, but this function needs neither ctx nor a live session.
+def _fmt_rupees(value) -> str:
+    if value is None:
+        return "n/a"
+    return f"₹{value:,}"
 
-    `today_str` is the ONE deliberate, narrow use of the server clock
-    anywhere in this project - purely to detect and disclose staleness
-    (never to label, write, or stand in for a row's actual date, which
-    always comes from the summary itself). Every row/date shown below
-    still comes straight from the sheet; this comparison only decides
-    whether to say so plainly when someone asks for "today's" report and
-    the latest available one is from an earlier day.
+
+def _needs_attention_bullets(items: list) -> list:
+    if not items:
+        return ["Nothing needs attention right now."]
+    bullets = []
+    for item in items:
+        label = item.get("label") or item.get("source") or "(unlabeled)"
+        detail = item.get("detail") or ""
+        line = f"{label} — {detail}" if detail else label
+        if item.get("priority"):
+            line += f" (Priority: {item['priority']})"
+        if item.get("action"):
+            line += f" — Action: {item['action']}"
+        bullets.append(line)
+    return bullets
+
+
+def _what_changed_bullets(wc: dict) -> list:
+    bullets = []
+    if wc.get("new_open_issues"):
+        bullets.append(f"{wc['new_open_issues']} new open issue(s) as of {wc['monitoring_date']}")
+    if wc.get("resolved_issues"):
+        bullets.append(f"{wc['resolved_issues']} issue(s) resolved as of {wc['monitoring_date']}")
+    if wc.get("new_critical_high"):
+        bullets.append(f"{wc['new_critical_high']} new Critical/High issue(s) as of {wc['monitoring_date']}")
+    if wc.get("new_accounting_exceptions"):
+        bullets.append(f"{wc['new_accounting_exceptions']} new accounting exception(s) as of {wc['accounting_date']}")
+    for key, label in (("sales_change", "Sales"), ("purchase_change", "Purchases"), ("payments_change", "Payments")):
+        change = wc.get(key)
+        if not change:
+            continue
+        delta = change["delta"]
+        if delta > 0:
+            bullets.append(f"{label} up {_fmt_rupees(delta)} vs {change['previous_date']}")
+        elif delta < 0:
+            bullets.append(f"{label} down {_fmt_rupees(abs(delta))} vs {change['previous_date']}")
+        else:
+            bullets.append(f"{label} unchanged vs {change['previous_date']}")
+    if not bullets:
+        if not wc.get("monitoring_date") and not wc.get("accounting_date"):
+            bullets.append("No reports on record yet to compare.")
+        else:
+            bullets.append("No significant changes since the last report.")
+    return bullets
+
+
+def _patterns_risks_bullets(patterns: list) -> list:
+    if not patterns:
+        return ["No recurring patterns or risks identified from the current data."]
+    return [p["description"] for p in patterns]
+
+
+def _required_actions_bullets(actions: list) -> list:
+    if not actions:
+        return ["No outstanding actions right now."]
+    bullets = []
+    for a in actions:
+        label = a.get("label") or a.get("source") or "(unlabeled)"
+        line = f"{label}: {a.get('action', '')}"
+        if a.get("priority"):
+            line += f" (Priority: {a['priority']})"
+        bullets.append(line)
+    return bullets
+
+
+def _dashboard_summary_lines(dashboard: dict) -> list:
+    """Builds get_business_dashboard's plain-text response as a pure
+    function of already-computed data (no Sheets access, no ctx, no
+    server clock) - kept separate from the tool function itself purely so
+    this text-composition logic can be unit tested directly.
+
+    This is WORKFLOW 2 (owner dashboard) output ONLY - it must always
+    render EXACTLY the fixed structure: Executive Overview / Needs My
+    Attention / What Changed / Patterns & Risks / Required Actions,
+    followed by the "[Interactive Dashboard]" marker. No introductory
+    paragraph, no concluding paragraph, no narrative commentary ("Fresh
+    pull...", "Done...", "worth flagging...", "if you want...", etc.) -
+    every line must be one of the fixed headings or a concise data bullet.
+
+    The Executive Overview heading always states the actual latest report
+    date on record ("as of DD.MM.YYYY") rather than the server's current
+    date - so it can never imply today's data is being shown when the
+    latest real report is from an earlier day. Built entirely from the
+    already-computed dashboard sections (needs_attention, what_changed,
+    patterns_risks, required_actions) - never the raw 10-column row data,
+    which stays one click away in the interactive dashboard's detail view.
     """
     overview = dashboard["overview"]
     what_changed = dashboard["what_changed"]
     monitoring_date = what_changed.get("monitoring_date") or ""
     accounting_date = what_changed.get("accounting_date") or ""
+    latest_date = monitoring_date or accounting_date
 
-    summary_lines = ["AI Business Dashboard (live from Google Sheets):"]
-
-    if not monitoring_date:
-        summary_lines.append("Monitoring: no reports on record yet.")
-    elif monitoring_date != today_str:
-        summary_lines.append(f"Today's report ({today_str}) is not available. Latest available report: {monitoring_date}.")
-    else:
-        summary_lines.append(f"Monitoring report date: {monitoring_date}.")
-
-    if accounting_date and accounting_date != today_str:
-        summary_lines.append(f"Latest Accounting report: {accounting_date}.")
-    elif accounting_date:
-        summary_lines.append(f"Accounting report date: {accounting_date}.")
-
-    summary_lines.append(f"Open Issues: {overview['total_open_issues']} (Critical/High: {overview['critical_high_issues']})")
-    summary_lines.append(f"Needs Attention: {overview['needs_attention_count']}")
-
+    lines = []
+    lines.append(f"Executive Overview (as of {latest_date})" if latest_date else "Executive Overview (no reports on record yet)")
+    lines.append(f"- Open Issues: {overview['total_open_issues']}")
+    lines.append(f"- Critical/High: {overview['critical_high_issues']}")
     if overview.get("has_accounting_data"):
-        summary_lines.append(f"Accounting Exceptions: {overview['accounting_exceptions']}")
-        summary_lines.append(f"Sales Total: {overview['sales_total']} | Purchase Total: {overview['purchase_total']}")
-        if overview.get("outstanding_receivables_total"):
-            summary_lines.append(f"Outstanding Receivables: {overview['outstanding_receivables_total']}")
-        cash_position = overview.get("cash_position") or {}
-        if cash_position.get("as_of"):
-            closing = cash_position.get("Closing balance") or "n/a"
-            summary_lines.append(f"Cash Position (as of {cash_position['as_of']}): Closing balance {closing}")
+        lines.append(f"- Accounting Exceptions: {overview['accounting_exceptions']}")
+        lines.append(f"- Sales: {_fmt_rupees(overview['sales_total'])}")
+        lines.append(f"- Purchases: {_fmt_rupees(overview['purchase_total'])}")
+        lines.append(f"- Payments: {_fmt_rupees(overview.get('payments_total'))}")
     else:
         # Never a bare "₹0" here - a sum over zero rows and a sum of real
         # zero-value rows both come out to 0, and only this explicit line
         # tells them apart.
-        summary_lines.append("No accounting data available for this date.")
+        lines.append("- Accounting: no accounting data available for this date.")
 
-    if not apps_supported:
-        summary_lines.append(
-            "(This client does not support the MCP Apps interactive UI - showing computed totals only.)"
-        )
+    lines.append("")
+    lines.append("Needs My Attention")
+    lines.extend(f"- {b}" for b in _needs_attention_bullets(dashboard["needs_attention"]))
 
-    return summary_lines
+    lines.append("")
+    lines.append("What Changed")
+    lines.extend(f"- {b}" for b in _what_changed_bullets(what_changed))
+
+    lines.append("")
+    lines.append("Patterns & Risks")
+    lines.extend(f"- {b}" for b in _patterns_risks_bullets(dashboard["patterns_risks"]))
+
+    lines.append("")
+    lines.append("Required Actions")
+    lines.extend(f"- {b}" for b in _required_actions_bullets(dashboard["required_actions"]))
+
+    lines.append("")
+    lines.append("[Interactive Dashboard]")
+
+    return lines
 
 
 @apps.tool(resource_uri="ui://dashboard/app.html", visibility=["model", "app"])
 def get_business_dashboard(ctx: Context) -> CallToolResult:
-    """Compute and show the owner/executive-level AI Business Dashboard -
-    "what does the owner need to know today, what needs attention, what
-    changed, and what action is required": overview KPIs (open issues,
-    critical/high counts, resolved today, sales/purchase/payments/cash
-    totals), a Needs My Attention list combining both sheets with a
-    concrete next action per item, a What Changed Today comparison against
-    the most recent PRIOR reporting date actually present in the data (not
-    the server's clock), a Patterns & Risks list of recurring/notable
-    conditions the data itself supports, a Required Actions checklist, a
-    Monitoring section (priority/category breakdowns, sites needing
-    attention, recent actions, next actions, an open-issues trend when
-    more than one date is present), an Accounting section (record types,
-    amounts, cash position, tax/GST flags, high-priority exceptions,
-    pending items), and Recent Activity. The interactive Monitoring/
-    Accounting tables show only the handful of columns an owner actually
-    scans - every raw 10-column schema field is still available by
-    clicking a row open; the underlying Sheets data and schema are
-    untouched either way.
+    """WORKFLOW 2 (OWNER DASHBOARD) - the ONLY tool responsible for the
+    owner-facing dashboard. Strictly separate from WORKFLOW 1 (
+    process_monitoring_summary / process_accounting_summary): this tool
+    never writes to Google Sheets, and the processing tools never generate
+    dashboard/executive commentary. Do not merge the two - after a
+    process_monitoring_summary or process_accounting_summary call returns
+    its short confirmation, only call this tool separately, as its own
+    explicit step, if the owner's dashboard is actually being requested.
 
-    Everything is calculated FRESH from the current Monitoring and
-    Accounting Google Sheets rows on every call (via the same
-    sheets_service.get_tab_values used by the processing tools) - Google
-    Sheets remains the single source of truth, nothing is cached or
-    written back, and no synthetic aggregate row (e.g. "ALL SITES") is
-    ever created. Call this any time to see the current state, and
-    especially right after process_monitoring_summary or
-    process_accounting_summary to show the admin the just-updated
-    dashboard.
+    READ-ONLY: computes the dashboard FRESH from the current Monitoring
+    and Accounting Google Sheets rows on every call (via the same
+    sheets_service.get_tab_values used by the processing tools) and never
+    calls any Sheets-write function - Google Sheets remains the single
+    source of truth, nothing is cached or written back.
 
-    On an MCP Apps-capable client this renders as an interactive
-    dashboard inline in the chat, with its own Refresh button that re-
-    calls this tool for live data; on any other client it returns the
-    same computed totals as a concise text summary instead.
+    The textual response ALWAYS follows EXACTLY this fixed structure, with
+    NO introductory paragraph and NO concluding paragraph - no "Fresh
+    pull...", "Done...", "worth flagging...", "if you want...", "the
+    dashboard above...", or similar narrative:
 
-    The text summary always states the actual Monitoring/Accounting
-    report date(s) it's reporting on, and explicitly says so - "Today's
-    report (DD.MM.YYYY) is not available. Latest available report:
-    DD.MM.YYYY." - when the server's calendar date doesn't match the most
-    recent date on record, rather than silently presenting older data as
-    if it were current. It also never prints a bare "0" for Sales/
-    Purchases when Accounting simply has no rows yet - see "No accounting
-    data available for this date." vs. a real computed 0.
+        Executive Overview (as of DD.MM.YYYY)
+        - Open Issues: X
+        - Critical/High: X
+        - Accounting Exceptions: X
+        - Sales: ₹X
+        - Purchases: ₹X
+        - Payments: ₹X
+
+        Needs My Attention
+        - concise item
+
+        What Changed
+        - concise item
+
+        Patterns & Risks
+        - concise item
+
+        Required Actions
+        - concise item
+
+        [Interactive Dashboard]
+
+    The Executive Overview heading always states the actual latest report
+    date on record (never the server's clock), so it can never imply
+    today's data is shown when the latest real report is from an earlier
+    day. It never prints a bare "0" for Sales/Purchases/Payments when
+    Accounting simply has no rows for that date - see "no accounting data
+    available for this date" vs. a real computed 0. None of the five
+    sections ever expose raw 10-column row data in this text - that detail
+    stays one click away in the interactive dashboard.
+
+    On an MCP Apps-capable client the interactive dashboard also renders
+    inline in the chat, with its own Refresh button that re-calls this
+    tool for live data; on any other client only the text above is shown.
     """
     monitoring_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
     accounting_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
     dashboard = build_dashboard(monitoring_rows, accounting_rows)
 
-    summary_lines = _dashboard_summary_lines(
-        dashboard, client_supports_apps(ctx), date.today().strftime("%d.%m.%Y")
-    )
+    summary_lines = _dashboard_summary_lines(dashboard)
 
     return CallToolResult(
         content=[TextContent(type="text", text="\n".join(summary_lines))],
@@ -303,17 +386,28 @@ def process_monitoring_summary(summary: str) -> str:
     confident date can be extracted, this returns an error and writes
     NOTHING to Google Sheets - see summary_parser.parse_monitoring_summary.
 
-    After this returns, call get_business_dashboard to show the admin the
-    updated dashboard reflecting what was just written.
+    WORKFLOW 1 (EMPLOYEE REPORT PROCESSING) - strictly separate from
+    WORKFLOW 2 (get_business_dashboard, the owner dashboard). This tool
+    ONLY extracts concise structured records and saves them to Google
+    Sheets. On success its ENTIRE response is exactly:
+
+        Report processed successfully.
+
+        - Date: DD.MM.YYYY
+        - Records saved: N
+
+    Nothing else - no dashboard summary, no executive commentary, no
+    "worth flagging"/"worth checking", no missing-data explanations, no
+    recommendations, no discussion of previous reports or date gaps, no
+    claim that a dashboard was generated, and no raw report text. This
+    tool never writes its own response text into Google Sheets. Call
+    get_business_dashboard separately, as its own explicit step, if the
+    owner's dashboard is actually being requested - do not merge the two.
     """
 
     # Deterministic parsing of the raw text into a structured dict, then
     # reshaped into per-section row lists sharing MONITORING_HEADERS'
-    # column order - see summary_parser.py for both steps. Note
-    # build_monitoring_rows() produces no row at all for the day's
-    # aggregate figures (parsed["new_issues"]/["resolved_issues"]/
-    # ["total_open_issues"]/["issues_today_notes"]) - those are read
-    # directly off `parsed` below instead, for the response text only.
+    # column order - see summary_parser.py for both steps.
     parsed = parse_monitoring_summary(summary)
 
     # The report date must always come from the summary itself - if
@@ -355,28 +449,17 @@ def process_monitoring_summary(summary: str) -> str:
         rows["service_pattern_watch"], key_indexes=list(range(len(MONITORING_HEADERS))),
     )
 
-    # Daily aggregate figures are surfaced here, in the response text, so
-    # nothing from ISSUES TODAY is silently lost - just never persisted
-    # as a fake site row. A future Dashboard tab is expected to compute
-    # the equivalent KPIs from the individual rows above via formulas.
-    metrics_line = (
-        f"Daily metrics (reported here, not stored as a row): "
-        f"New Issues={parsed['new_issues']}, "
-        f"Issues Resolved={parsed['resolved_issues']}, "
-        f"Total Open Issues={parsed['total_open_issues']}"
-    )
-    issues_today_notes = parsed.get("issues_today_notes", "")
-    if issues_today_notes:
-        metrics_line += f"\nDaily metrics notes: {issues_today_notes}"
+    # The day's ISSUES TODAY aggregate figures (New Issues/Issues
+    # Resolved/Total Open Issues) are intentionally not surfaced here -
+    # this tool's response is ONLY the fixed processing confirmation
+    # (see docstring); executive-level totals belong to get_business_
+    # dashboard, computed independently from the rows actually in Sheets.
+    records_saved = needs_attention_count + actions_taken_count + needed_next_count + pattern_count
 
     return (
-        "Monitoring summary processed successfully.\n"
-        f"Date: {report_date}\n"
-        f"{metrics_line}\n"
-        f"Needs Attention: {needs_attention_count} row(s)\n"
-        f"Actions Taken: {actions_taken_count} row(s)\n"
-        f"What's Needed Next: {needed_next_count} row(s)\n"
-        f"Service Pattern Watch: {pattern_count} row(s)"
+        "Report processed successfully.\n\n"
+        f"- Date: {report_date}\n"
+        f"- Records saved: {records_saved}"
     )
 
 
@@ -403,8 +486,23 @@ def process_accounting_summary(summary: str) -> str:
     Parsing is deterministic (no LLM call here) and tied to the fixed
     template. Re-running the same summary will not create duplicate rows.
 
-    After this returns, call get_business_dashboard to show the admin the
-    updated dashboard reflecting what was just written.
+    WORKFLOW 1 (EMPLOYEE REPORT PROCESSING) - strictly separate from
+    WORKFLOW 2 (get_business_dashboard, the owner dashboard). This tool
+    ONLY extracts concise structured records and saves them to Google
+    Sheets. On success its ENTIRE response is exactly:
+
+        Report processed successfully.
+
+        - Date: DD.MM.YYYY
+        - Records saved: N
+
+    Nothing else - no dashboard summary, no executive commentary, no
+    "worth flagging"/"worth checking", no missing-data explanations, no
+    recommendations, no discussion of previous reports or date gaps, no
+    claim that a dashboard was generated, and no raw report text. This
+    tool never writes its own response text into Google Sheets. Call
+    get_business_dashboard separately, as its own explicit step, if the
+    owner's dashboard is actually being requested - do not merge the two.
     """
 
     parsed = parse_accounting_summary(summary)
@@ -445,19 +543,18 @@ def process_accounting_summary(summary: str) -> str:
         rows["pending"], key_indexes=list(range(len(ACCOUNTING_HEADERS))),
     )
 
+    # This tool's response is ONLY the fixed processing confirmation (see
+    # docstring) - per-section breakdowns belong to get_business_dashboard,
+    # computed independently from the rows actually in Sheets.
+    records_saved = (
+        len(rows["cash"]) + len(rows["purchase"])
+        + issues_count + sales_count + expenses_count + tax_count + pending_count
+    )
+
     return (
-        "Accounting summary processed successfully.\n"
-        f"Date: {report_date}\n"
-        "Sections processed: Issues Requiring Attention, Cash & Bank Position, "
-        "Sales, Purchase, Expenses & Journal Entries, GST/Tax Watch Items, "
-        "Pending From Yesterday\n"
-        f"Cash & Bank Position: {'updated (' + str(len(rows['cash'])) + ' row(s))' if rows['cash'] else '0 row(s)'}\n"
-        f"Purchase: {'updated (' + str(len(rows['purchase'])) + ' row(s))' if rows['purchase'] else '0 row(s)'}\n"
-        f"Issues Requiring Attention: {issues_count} row(s)\n"
-        f"Sales: {sales_count} row(s)\n"
-        f"Expenses & Journal Entries: {expenses_count} row(s)\n"
-        f"GST/Tax Watch Items: {tax_count} row(s)\n"
-        f"Pending From Yesterday: {pending_count} row(s)"
+        "Report processed successfully.\n\n"
+        f"- Date: {report_date}\n"
+        f"- Records saved: {records_saved}"
     )
 
 

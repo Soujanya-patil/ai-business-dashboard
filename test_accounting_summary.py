@@ -362,13 +362,8 @@ if __name__ == "__main__":
 
         result_1 = process_accounting_summary(summary_text)
         print(result_1)
-        assert "Cash & Bank Position: updated" in result_1
-        assert "Purchase: updated" in result_1
-        assert "Issues Requiring Attention: 1 row(s)" in result_1
-        assert "Sales: 2 row(s)" in result_1
-        assert "Expenses & Journal Entries: 1 row(s)" in result_1
-        assert "GST/Tax Watch Items: 1 row(s)" in result_1
-        assert "Pending From Yesterday: 1 row(s)" in result_1
+        # 4 cash + 1 purchase + 1 issue + 2 sales + 1 expense + 1 tax + 1 pending = 11
+        assert result_1 == "Report processed successfully.\n\n- Date: " + synthetic_date_output + "\n- Records saved: 11", result_1
 
         all_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
         header = all_rows[0]
@@ -386,14 +381,10 @@ if __name__ == "__main__":
 
         result_2 = process_accounting_summary(summary_text)
         print(result_2)
-        assert "Issues Requiring Attention: 0 row(s)" in result_2
-        assert "Sales: 0 row(s)" in result_2
-        assert "Expenses & Journal Entries: 0 row(s)" in result_2
-        assert "GST/Tax Watch Items: 0 row(s)" in result_2
-        assert "Pending From Yesterday: 0 row(s)" in result_2
-        # Cash/Purchase are upserts, so they still report "updated" (in place), not a count.
-        assert "Cash & Bank Position: updated" in result_2
-        assert "Purchase: updated" in result_2
+        # Cash/Purchase are upserts, so they still count as "saved" (updated
+        # in place) on the duplicate run - only the append-if-not-duplicate
+        # sections (issues/sales/expenses/tax/pending) drop to 0: 4 + 1 = 5.
+        assert result_2 == "Report processed successfully.\n\n- Date: " + synthetic_date_output + "\n- Records saved: 5", result_2
 
         date_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB) if row[0] == synthetic_date_output]
         assert len(date_rows_after) == len(date_rows), (
@@ -413,5 +404,67 @@ EXPENSES & JOURNAL ENTRIES
     d2 = parse_accounting_summary(date_format_summary.replace("03-Sep-26", "4-Sep-26"))
     assert d2["date"] == "04.09.2026", d2["date"]
     print("OK: '03-Sep-26' -> '03.09.2026', '4-Sep-26' -> '04.09.2026'.\n")
+
+    print("=== Test 16: process_accounting_summary (WORKFLOW 1) never merges into the owner dashboard (WORKFLOW 2) ===")
+    import ast
+    import inspect
+
+    process_source = inspect.getsource(process_accounting_summary)
+    # Structural proof: this tool's code path never calls the dashboard-
+    # building functions - Workflow 1 (employee report processing) and
+    # Workflow 2 (get_business_dashboard, the owner dashboard) must stay
+    # fully separate.
+    for forbidden_call in ("build_dashboard", "_dashboard_summary_lines", "get_business_dashboard("):
+        assert forbidden_call not in process_source, (
+            f"process_accounting_summary must never reference {forbidden_call!r} - "
+            "Workflow 1 and Workflow 2 must stay separate"
+        )
+    # The EXECUTABLE code (docstring excluded, since the docstring itself
+    # documents these as BANNED phrases, which would otherwise be a false
+    # positive) must never actually produce dashboard/narrative language.
+    func_node = ast.parse(process_source).body[0]
+    body_nodes = func_node.body[1:] if isinstance(func_node.body[0], ast.Expr) else func_node.body
+    code_only = "\n".join(ast.get_source_segment(process_source, n) for n in body_nodes).lower()
+    for banned_phrase in (
+        "worth flagging", "worth checking", "if you want", "dashboard above",
+        "master issue tracker", "this matches", "nothing suspicious",
+        "fresh pull", "executive overview", "needs my attention",
+    ):
+        assert banned_phrase not in code_only, (
+            f"Found banned dashboard/narrative phrase {banned_phrase!r} in process_accounting_summary's executable code"
+        )
+    assert '"report processed successfully.' in code_only, (
+        "Success response must use the fixed 'Report processed successfully.' confirmation template"
+    )
+    print("OK: process_accounting_summary's code path never calls dashboard-building functions, "
+          "and its response template carries no narrative language.\n")
+
+    print("=== Test 17: process_accounting_summary's SUCCESS response is exactly the fixed confirmation format ===")
+    # append_unique_rows is stubbed out for the duration of this call, so
+    # this exercises the real function end-to-end (parsing, row-building,
+    # response assembly) WITHOUT making any live Sheets/network call - it
+    # always runs (no RUN_LIVE_SHEETS_TESTS gate needed). The fixture has
+    # no Cash/Purchase section, so upsert_row_by_key is never invoked.
+    import mcp_server
+
+    original_append_unique_rows = mcp_server.append_unique_rows
+
+    def _fake_append_unique_rows(service, spreadsheet_id, tab_name, headers, rows, key_indexes):
+        return len(rows)
+
+    mcp_server.append_unique_rows = _fake_append_unique_rows
+    try:
+        stub_summary = """SUNTROP SOLAR — DAY BOOK SUMMARY | 03-Sep-26
+
+EXPENSES & JOURNAL ENTRIES
+- Minor stationery purchase ₹500
+"""
+        stub_result = process_accounting_summary(stub_summary)
+    finally:
+        mcp_server.append_unique_rows = original_append_unique_rows
+
+    print(stub_result)
+    assert stub_result == "Report processed successfully.\n\n- Date: 03.09.2026\n- Records saved: 1", stub_result
+    print("OK: the success response is EXACTLY 'Report processed successfully.' + '- Date: ...' + '- Records saved: N' - nothing else.\n")
 
     print("All process_accounting_summary() tests passed.")

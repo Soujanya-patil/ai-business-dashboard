@@ -489,13 +489,8 @@ if __name__ == "__main__":
 
         result_1 = process_monitoring_summary(summary_text)
         print(result_1)
-        assert "Needs Attention: 1 row(s)" in result_1
-        assert "Actions Taken: 1 row(s)" in result_1
-        assert "What's Needed Next: 1 row(s)" in result_1
-        assert "Service Pattern Watch: 1 row(s)" in result_1
+        assert result_1 == "Report processed successfully.\n\n- Date: " + synthetic_date_output + "\n- Records saved: 4", result_1
         assert "ALL SITES" not in result_1, "Response text must never mention an aggregate site"
-        assert "Daily Summary: updated" not in result_1, "Daily Summary is no longer written as a row"
-        assert "Daily metrics" in result_1, "Daily New Issues/Resolved/Total Open figures must still be reported back"
 
         all_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
         header = all_rows[0]
@@ -510,10 +505,7 @@ if __name__ == "__main__":
 
         result_2 = process_monitoring_summary(summary_text)
         print(result_2)
-        assert "Needs Attention: 0 row(s)" in result_2
-        assert "Actions Taken: 0 row(s)" in result_2
-        assert "What's Needed Next: 0 row(s)" in result_2
-        assert "Service Pattern Watch: 0 row(s)" in result_2
+        assert result_2 == "Report processed successfully.\n\n- Date: " + synthetic_date_output + "\n- Records saved: 0", result_2
 
         tagged_rows_after = [row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB) if any(run_id in str(cell) for cell in row)]
         assert len(tagged_rows_after) == len(tagged_rows), (
@@ -534,14 +526,16 @@ if __name__ == "__main__":
         messy_result_1 = process_monitoring_summary(messy_summary_text)
         print(messy_result_1)
         # The 2-site tripping bullet produces 2 Needs Attention rows; the
-        # 2-site inline Service Pattern Watch mention produces 2 more rows.
-        assert "Needs Attention: 2 row(s)" in messy_result_1, messy_result_1
-        assert "Actions Taken: 1 row(s)" in messy_result_1, messy_result_1
-        assert "What's Needed Next: 2 row(s)" in messy_result_1, messy_result_1
-        assert "Service Pattern Watch: 2 row(s)" in messy_result_1, messy_result_1
+        # 2-site inline Service Pattern Watch mention produces 2 more rows:
+        # 2 (Needs Attention) + 1 (Actions Taken) + 2 (What's Needed Next) +
+        # 2 (Service Pattern Watch) = 7 records saved. (The Unconfirmed New
+        # Issues figure is preserved at the parser level - see Test 10 -
+        # but is no longer surfaced in this tool's response text by design:
+        # the response is ONLY the fixed processing confirmation.)
+        assert messy_result_1 == (
+            "Report processed successfully.\n\n- Date: " + messy_synthetic_date_output + "\n- Records saved: 7"
+        ), messy_result_1
         assert "ALL SITES" not in messy_result_1
-        assert "Daily metrics" in messy_result_1
-        assert "Unconfirmed" in messy_result_1, "The Unconfirmed New Issues figure must still be reported back"
 
         messy_tagged_before = [
             row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
@@ -556,10 +550,9 @@ if __name__ == "__main__":
 
         messy_result_2 = process_monitoring_summary(messy_summary_text)
         print(messy_result_2)
-        assert "Needs Attention: 0 row(s)" in messy_result_2, messy_result_2
-        assert "Actions Taken: 0 row(s)" in messy_result_2, messy_result_2
-        assert "What's Needed Next: 0 row(s)" in messy_result_2, messy_result_2
-        assert "Service Pattern Watch: 0 row(s)" in messy_result_2, messy_result_2
+        assert messy_result_2 == (
+            "Report processed successfully.\n\n- Date: " + messy_synthetic_date_output + "\n- Records saved: 0"
+        ), messy_result_2
 
         messy_tagged_after = [
             row for row in get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
@@ -649,5 +642,82 @@ ACTIONS TAKEN TODAY
         assert row[date_col] == expected_sheet_date, f"Row did not carry the summary's own date: {row}"
     print(f"OK: all {len(all_generated_rows)} rows generated from this summary carry its date ({expected_sheet_date}), "
           f"not today's server date ({_date.today().strftime('%d.%m.%Y')}).\n")
+
+    print("=== Test 22: reprocessing the same summary is deterministic (the precondition sheets_service's exact-match ===")
+    print("             dedup relies on to guarantee no duplicate rows are ever written) ===")
+    # sheets_service.append_unique_rows/upsert_row_by_key detect a
+    # duplicate by comparing rows for EXACT equality - that guarantee only
+    # holds if parsing + row-building is itself a pure, deterministic
+    # function of the summary text. This proves that precondition locally,
+    # without touching Google Sheets (the live round-trip is covered
+    # separately by the opt-in RUN_LIVE_SHEETS_TESTS=1 Tests 16-17 above).
+    first_pass = build_monitoring_rows(parse_monitoring_summary(MESSY_SUMMARY))
+    second_pass = build_monitoring_rows(parse_monitoring_summary(MESSY_SUMMARY))
+    assert first_pass == second_pass, "Re-parsing/re-building the identical summary must yield byte-identical rows"
+    print("OK: parsing and building the same summary twice produces byte-identical rows.\n")
+
+    print("=== Test 23: process_monitoring_summary (WORKFLOW 1) never merges into the owner dashboard (WORKFLOW 2) ===")
+    import ast
+    import inspect
+
+    process_source = inspect.getsource(process_monitoring_summary)
+    # Structural proof: this tool's code path never calls the dashboard-
+    # building functions - Workflow 1 (employee report processing) and
+    # Workflow 2 (get_business_dashboard, the owner dashboard) must stay
+    # fully separate. process_monitoring_summary can never itself compute
+    # or claim to have generated a dashboard.
+    for forbidden_call in ("build_dashboard", "_dashboard_summary_lines", "get_business_dashboard("):
+        assert forbidden_call not in process_source, (
+            f"process_monitoring_summary must never reference {forbidden_call!r} - "
+            "Workflow 1 and Workflow 2 must stay separate"
+        )
+    # The EXECUTABLE code (docstring excluded, since the docstring itself
+    # documents these as BANNED phrases - e.g. 'no "worth flagging"...' -
+    # which would otherwise be a false positive) must never actually
+    # produce dashboard/narrative/hedging language in a real response.
+    func_node = ast.parse(process_source).body[0]
+    body_nodes = func_node.body[1:] if isinstance(func_node.body[0], ast.Expr) else func_node.body
+    code_only = "\n".join(ast.get_source_segment(process_source, n) for n in body_nodes).lower()
+    for banned_phrase in (
+        "worth flagging", "worth checking", "if you want", "dashboard above",
+        "master issue tracker", "this matches", "nothing suspicious",
+        "fresh pull", "executive overview", "needs my attention",
+    ):
+        assert banned_phrase not in code_only, (
+            f"Found banned dashboard/narrative phrase {banned_phrase!r} in process_monitoring_summary's executable code"
+        )
+    assert '"report processed successfully.' in code_only, (
+        "Success response must use the fixed 'Report processed successfully.' confirmation template"
+    )
+    print("OK: process_monitoring_summary's code path never calls dashboard-building functions, "
+          "and its response template carries no narrative language.\n")
+
+    print("=== Test 24: process_monitoring_summary's SUCCESS response is exactly the fixed confirmation format ===")
+    # append_unique_rows is stubbed out for the duration of this call, so
+    # this exercises the real function end-to-end (parsing, row-building,
+    # response assembly) WITHOUT making any live Sheets/network call -
+    # unlike Tests 16-17, this one always runs (no RUN_LIVE_SHEETS_TESTS
+    # gate needed) since it never touches the production spreadsheet.
+    import mcp_server
+
+    original_append_unique_rows = mcp_server.append_unique_rows
+
+    def _fake_append_unique_rows(service, spreadsheet_id, tab_name, headers, rows, key_indexes):
+        return len(rows)
+
+    mcp_server.append_unique_rows = _fake_append_unique_rows
+    try:
+        stub_summary = """SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26
+
+NEEDS ATTENTION
+- Test Site — minor issue — open 1 day — no action needed yet
+"""
+        stub_result = process_monitoring_summary(stub_summary)
+    finally:
+        mcp_server.append_unique_rows = original_append_unique_rows
+
+    print(stub_result)
+    assert stub_result == "Report processed successfully.\n\n- Date: 03.09.2026\n- Records saved: 1", stub_result
+    print("OK: the success response is EXACTLY 'Report processed successfully.' + '- Date: ...' + '- Records saved: N' - nothing else.\n")
 
     print("All process_monitoring_summary() tests passed.")

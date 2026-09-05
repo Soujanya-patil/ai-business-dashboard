@@ -820,12 +820,16 @@ def _classify_status(text: str, default: str = "") -> str:
 # --- Next Action extraction ----------------------------------------------
 # Same idea as accounting_parser.py's recommended-action split: an
 # explicit "→" marker is the strongest signal ("<observation> → <what to
-# do>"); failing that, a recommend/suggest/advise/please trigger word,
-# split at the nearest preceding clause delimiter so the action comes out
-# as its own clean clause. No trigger at all -> no Next Action, blank
+# do>"); failing that, a recommend/suggest/advise/please/"going for"
+# trigger phrase, split at the nearest preceding clause delimiter so the
+# action comes out as its own clean clause. "going for"/"scheduled for"/
+# "planned for" are exactly as explicit a forward-looking marker as
+# "recommend" in real reports (e.g. "3 optimizers received; tomorrow
+# going for replacement.") - no trigger at all -> no Next Action, blank
 # rather than guessed.
 _ACTION_TRIGGER_RE = re.compile(
-    r"\brecommend(?:ed|ation)?\b|\bsuggest(?:ed|ion)?\b|\badvis(?:e|ed|ory)\b|\bplease\b",
+    r"\brecommend(?:ed|ation)?\b|\bsuggest(?:ed|ion)?\b|\badvis(?:e|ed|ory)\b|\bplease\b"
+    r"|\bgoing\s+for\b|\bscheduled\s+for\b|\bplanned\s+for\b",
     re.IGNORECASE,
 )
 _CLAUSE_DELIM_RE = re.compile(r"[;,.]|—|–|\s-\s")
@@ -907,12 +911,71 @@ def _action_signals(text: str):
     return None
 
 
+# Pure filler words that never carry business meaning in a short cell,
+# regardless of how short the surrounding text already is - stripped
+# BEFORE text_summarizer.shorten()'s concise-length check, unlike every
+# other word (which shorten() only ever touches once text is long enough
+# to actually need shortening). "today"/"tomorrow" are redundant with the
+# Date column; "repeated" adds no information a short Issue phrase needs.
+# This never touches the lossless parsed data (see parse_monitoring_
+# summary) - only the final shortened Sheet-cell text.
+_FILLER_WORD_RE = re.compile(r"\b(?:repeated(?:ly)?|today|tomorrow)\b\.?,?", re.IGNORECASE)
+
+# Stripped ONLY from text destined for the Next Action column - once text
+# is already in that column, a leading "going for"/"scheduled for"/
+# "planned for" is redundant with the column heading itself.
+_NEXT_ACTION_FILLER_RE = re.compile(r"^(?:going\s+for|scheduled\s+for|planned\s+for|to\s+be)\s+", re.IGNORECASE)
+
+# A leading item count before a known equipment noun is dropped and the
+# noun singularized - "3 optimizers received" -> "Optimizer received".
+# The count itself isn't invented away (Accounting has a real Count
+# column for exactly this kind of figure; Monitoring's Issue/Action Taken
+# columns are for WHAT happened, not a tally).
+_EQUIPMENT_COUNT_RE = re.compile(r"^\d+\s+(optimizers?|inverters?)\b", re.IGNORECASE)
+_EQUIPMENT_SINGULAR = {"optimizer": "Optimizer", "optimizers": "Optimizer", "inverter": "Inverter", "inverters": "Inverter"}
+
+
+def _clean_phrase(text: str) -> str:
+    """Collapses whitespace/punctuation left behind after removing a word
+    from the middle of a phrase, and capitalizes the result if it would
+    otherwise start lowercase (text extracted mid-sentence has no
+    sentence-initial capital of its own to preserve)."""
+    cleaned = re.sub(r"\s+", " ", text).strip(" .,;:—–-")
+    if not cleaned:
+        return ""
+    return cleaned[0].upper() + cleaned[1:] if cleaned[0].islower() else cleaned
+
+
+def _strip_filler_words(text: str) -> str:
+    if not _FILLER_WORD_RE.search(text):
+        return text
+    cleaned = _clean_phrase(_FILLER_WORD_RE.sub("", text))
+    return cleaned or text.strip()
+
+
+def _normalize_equipment_count(text: str) -> str:
+    match = _EQUIPMENT_COUNT_RE.match(text.strip())
+    if not match:
+        return text
+    singular = _EQUIPMENT_SINGULAR[match.group(1).lower()]
+    rest = text.strip()[match.end():].strip()
+    return f"{singular} {rest}".strip()
+
+
+def _clean_next_action(text: str) -> str:
+    filler_stripped = _strip_filler_words(text)
+    next_action_stripped = _NEXT_ACTION_FILLER_RE.sub("", filler_stripped).strip()
+    if next_action_stripped == text.strip():
+        return text
+    return _clean_phrase(next_action_stripped) or text.strip()
+
+
 def _shorten_issue_text(text: str) -> str:
-    return shorten(text, signal_fn=_issue_signals)
+    return shorten(_normalize_equipment_count(_strip_filler_words(text)), signal_fn=_issue_signals)
 
 
 def _shorten_action_text(text: str) -> str:
-    return shorten(text, signal_fn=_action_signals, concise_words=6, truncate_words=6)
+    return shorten(_clean_next_action(text), signal_fn=_action_signals, concise_words=6, truncate_words=6)
 
 
 def _empty_row(date_value: str, site: str = "") -> list:
@@ -975,17 +1038,28 @@ def build_monitoring_rows(parsed: dict) -> dict:
         combined = f"{item['description']} {item['action']}".strip()
         remaining, action_clause = _split_next_action(item["action"])
         row = _empty_row(date_value, item["site"])
-        # Issue falls back to the action text itself when there's no
-        # separately-extracted issue, so the column is never blank
-        # while Action Taken has real content.
-        issue_source = item["description"] or item["action"]
-        row[_COL["Issue"]] = _shorten_issue_text(issue_source)
-        row[_COL["Category"]] = _classify_category(combined)
+        category = _classify_category(combined)
+        next_action_text = _shorten_action_text(action_clause) if action_clause else ""
+        if not item["description"] and next_action_text and category:
+            # No separately-extracted issue text, but a concrete next step
+            # WAS found (e.g. "3 optimizers received; tomorrow going for
+            # replacement.") - synthesize a short label from the two facts
+            # already extracted (category + next action) rather than
+            # repeating the action-taken text verbatim into Issue too.
+            row[_COL["Issue"]] = f"{category} {next_action_text.lower()}"
+        else:
+            # Issue falls back to the action text itself when there's no
+            # separately-extracted issue and no next-action to combine
+            # with, so the column is never blank while Action Taken has
+            # real content.
+            issue_source = item["description"] or item["action"]
+            row[_COL["Issue"]] = _shorten_issue_text(issue_source)
+        row[_COL["Category"]] = category
         row[_COL["Priority"]] = _classify_priority(combined)
         row[_COL["Status"]] = _classify_status(combined, default="Open")
         row[_COL["Action Taken"]] = _shorten_issue_text(remaining)
-        if action_clause:
-            row[_COL["Next Action"]] = _shorten_action_text(action_clause)
+        if next_action_text:
+            row[_COL["Next Action"]] = next_action_text
         actions_taken_rows.append(row)
 
     whats_needed_next_rows = []

@@ -59,12 +59,22 @@ Next) - Tests 38-41 reproduce the real bug report's exact shape (39 total
 rows, only 10 of them genuine issues) and check every angle of that
 distinction. Tests 42-43 check the has_accounting_data distinction (no
 rows vs. real computed zero) all the way through to both dashboard_app.
-html and mcp_server._dashboard_summary_lines. Tests 44-45 check
-_dashboard_summary_lines' date-honesty behavior directly - it's a pure
-function extracted from get_business_dashboard specifically so it's
-testable without a live MCP session (client_supports_apps needs a real
-ctx that a test can't construct); get_business_dashboard's actual
-behavior is unchanged, this is a pure refactor.
+html and mcp_server._dashboard_summary_lines. Tests 44-46 check
+_dashboard_summary_lines' output directly - it's a pure function
+extracted from get_business_dashboard (no ctx, no Sheets access, no
+server clock) specifically so it's testable without a live MCP session.
+
+Strict workflow separation (Tests 44-49): WORKFLOW 1 (process_monitoring_
+summary/process_accounting_summary) and WORKFLOW 2 (get_business_
+dashboard) must never bleed into each other. get_business_dashboard's
+text ALWAYS renders EXACTLY Executive Overview / Needs My Attention /
+What Changed / Patterns & Risks / Required Actions / "[Interactive
+Dashboard]" - no introductory or concluding narrative, and the Executive
+Overview heading states the actual latest report date on record rather
+than comparing against the server's clock, so it can never imply stale
+data is "today's". See test_process_summary.py/test_accounting_summary.py
+for the matching WORKFLOW 1 proof (the processing tools' response is
+ONLY "Report processed successfully. / - Date: ... / - Records saved: N").
 
 Owner-level dashboard (Tests 26-37): "today" is always the most recent
 DATE ACTUALLY PRESENT in each sheet's own rows, never the server clock -
@@ -591,37 +601,144 @@ if __name__ == "__main__":
     print("=== Test 43: the no-data-vs-zero distinction reaches dashboard_app.html and the text summary ===")
     assert "has_accounting_data" in html_text, "dashboard_app.html must read the has_accounting_data flag"
     assert "No accounting data available for this date." in html_text
-    no_acc_lines = srv._dashboard_summary_lines(no_data_dashboard, True, "03.09.2026")
-    assert "No accounting data available for this date." in no_acc_lines, no_acc_lines
-    assert not any("Sales Total: 0" in line or "₹0" in line for line in no_acc_lines), (
+    no_acc_lines = srv._dashboard_summary_lines(no_data_dashboard)
+    assert any("no accounting data available for this date" in line.lower() for line in no_acc_lines), no_acc_lines
+    assert not any("sales: ₹0" in line.lower() or "sales: 0" in line.lower() for line in no_acc_lines), (
         f"Must never print a bare 0/₹0 for Sales when there is no Accounting data at all: {no_acc_lines}"
     )
-    real_zero_lines = srv._dashboard_summary_lines(real_zero_dashboard, True, "03.09.2026")
-    assert any("Sales Total: 0" in line for line in real_zero_lines), (
+    real_zero_lines = srv._dashboard_summary_lines(real_zero_dashboard)
+    assert any(line.strip() == "- Sales: ₹0" for line in real_zero_lines), (
         f"A real computed 0 (from an actual Sale row) must still be shown as 0: {real_zero_lines}"
     )
     print("OK: dashboard_app.html and the MCP text response both distinguish no-data from a real zero.\n")
 
-    print("=== Test 44: _dashboard_summary_lines exposes the actual report date, and flags an unavailable 'today' ===")
+    print("=== Test 44: _dashboard_summary_lines always labels the Executive Overview with the ACTUAL report date ===")
     current_dashboard = build_dashboard(
         [MON_HEADER, ["05.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
         [ACC_HEADER],
     )
-    current_lines = srv._dashboard_summary_lines(current_dashboard, True, "05.09.2026")
-    assert "Monitoring report date: 05.09.2026." in current_lines, current_lines
+    current_lines = srv._dashboard_summary_lines(current_dashboard)
+    assert "Executive Overview (as of 05.09.2026)" in current_lines, current_lines
 
     stale_dashboard = build_dashboard(
         [MON_HEADER, ["03.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
         [ACC_HEADER],
     )
-    stale_lines = srv._dashboard_summary_lines(stale_dashboard, True, "05.09.2026")
-    assert "Today's report (05.09.2026) is not available. Latest available report: 03.09.2026." in stale_lines, stale_lines
-    print("OK: the response states the real report date, and explicitly flags when it isn't today's.\n")
+    stale_lines = srv._dashboard_summary_lines(stale_dashboard)
+    assert "Executive Overview (as of 03.09.2026)" in stale_lines, (
+        "The Executive Overview must be labelled with the actual latest report date on record"
+    )
+    # No comparison against the server clock at all - the heading always
+    # states the real data date, so it can never falsely imply the data is
+    # from "today" (whatever today happens to be) when it isn't.
+    assert not any("today" in line.lower() for line in stale_lines), (
+        f"Must never claim data is from 'today' - only ever state the actual report date: {stale_lines}"
+    )
+    print("OK: the response always states the real report date and never claims it's 'today's' data.\n")
 
     print("=== Test 45: no developer/debug language in the normal owner-facing response ===")
     for banned in ("almost certainly", "doesn't look wired", "unverified", "test submissions", "test_connection", "unreliable"):
         assert banned not in " ".join(current_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
         assert banned not in " ".join(stale_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
     print("OK: the response text is factual and free of developer/debug language.\n")
+
+    print("=== Test 46: the owner-facing response uses EXACTLY the fixed structure - no intro/outro narrative ===")
+    for lines in (stale_lines, no_acc_lines, current_lines):
+        assert lines[0].startswith("Executive Overview"), (
+            f"Response must start directly with Executive Overview - no introductory paragraph: {lines}"
+        )
+        assert lines[-1] == "[Interactive Dashboard]", (
+            f"Response must end with the interactive dashboard marker - no concluding paragraph: {lines}"
+        )
+        for heading in ("Executive Overview", "Needs My Attention", "What Changed", "Patterns & Risks", "Required Actions"):
+            assert any(line == heading or line.startswith(heading + " (") for line in lines), (
+                f"Missing required section heading {heading!r}: {lines}"
+            )
+        joined = " ".join(lines).lower()
+        for banned_phrase in (
+            "ai business dashboard (live", "does not support the mcp apps",
+            "fresh pull", "done —", "done -", "worth flagging", "worth checking",
+            "if you want", "the dashboard above", "this matches", "nothing suspicious",
+            "no changes since the last pull", "since the master issue tracker",
+        ):
+            assert banned_phrase not in joined, f"Found banned intro/outro/narrative text {banned_phrase!r}: {lines}"
+    # The raw 10-column data must never appear in the text response - only
+    # in the interactive dashboard's detail view (see Test 35).
+    assert not any("Days Open" in line or "Vendor" in line or "Risk / Tax Flag" in line for line in stale_lines), (
+        "The text response must never dump raw column data - it stays one click away in the interactive dashboard"
+    )
+    print("OK: EXACTLY Executive Overview / Needs My Attention / What Changed / Patterns & Risks / Required Actions / ")
+    print("    [Interactive Dashboard] - never a bare intro or concluding paragraph.\n")
+
+    print("=== Test 47: employee report narrative extraction - the exact worked examples from the spec ===")
+    from summary_parser import parse_monitoring_summary, build_monitoring_rows
+
+    ex1 = build_monitoring_rows(parse_monitoring_summary(
+        "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26\n\n"
+        "NEEDS ATTENTION\n"
+        "- 079 Oaza Global Krishnagiri — full outage today (all 4 inverters down, 280 min collectively) "
+        "plus 31 optimizers at 100% down and 59 at 50% down out of 615, with remark inverter no 5 is not working.\n"
+    ))["needs_attention"][0]
+    assert ex1[MONITORING_HEADERS.index("Site")] == "079 Oaza Global Krishnagiri"
+    assert ex1[MONITORING_HEADERS.index("Issue")] == "Full inverter outage + Optimizer failures", ex1
+    assert ex1[MONITORING_HEADERS.index("Category")] == "Outage"
+    assert ex1[MONITORING_HEADERS.index("Status")] == "Open"
+
+    ex2 = build_monitoring_rows(parse_monitoring_summary(
+        "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26\n\n"
+        "NEEDS ATTENTION\n"
+        "- 027 Ranganath babu Mahalakshmi layout — repeated inverter tripping today.\n"
+    ))["needs_attention"][0]
+    assert ex2[MONITORING_HEADERS.index("Issue")] == "Inverter tripping", (
+        f"Expected the concise canonical phrase, not the narrative with 'repeated'/'today' filler intact: {ex2}"
+    )
+    assert ex2[MONITORING_HEADERS.index("Category")] == "Inverter"
+    assert ex2[MONITORING_HEADERS.index("Status")] == "Open"
+
+    ex3 = build_monitoring_rows(parse_monitoring_summary(
+        "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26\n\n"
+        "ACTIONS TAKEN TODAY\n"
+        "- 011 R P Metal Sections — 3 optimizers received; tomorrow going for replacement.\n"
+    ))["actions_taken"][0]
+    assert ex3[MONITORING_HEADERS.index("Site")] == "011 R P Metal Sections"
+    assert ex3[MONITORING_HEADERS.index("Issue")] == "Optimizer replacement", ex3
+    assert ex3[MONITORING_HEADERS.index("Category")] == "Optimizer"
+    assert ex3[MONITORING_HEADERS.index("Status")] == "Open"
+    assert ex3[MONITORING_HEADERS.index("Action Taken")] == "Optimizer received", ex3
+    assert ex3[MONITORING_HEADERS.index("Next Action")] == "Replacement", ex3
+    print("OK: all three worked examples from the spec produce exactly the specified concise rows.\n")
+
+    print("=== Test 48: narrative language never survives into a stored cell ===")
+    narrative_row = build_monitoring_rows(parse_monitoring_summary(
+        "SUNTROP SOLAR — PLANT MONITORING SUMMARY | 03-Sep-26\n\n"
+        "NEEDS ATTENTION\n"
+        "- Site X — this is worth flagging because it cannot be confirmed yet, and if you want, "
+        "it's worth checking with the vendor since the tool couldn't verify the exact cause today.\n"
+    ))["needs_attention"][0]
+    stored_text = " ".join(str(c) for c in narrative_row).lower()
+    for banned_phrase in (
+        "worth flagging", "this is important because", "cannot be confirmed",
+        "if you want", "worth checking", "the tool couldn't",
+    ):
+        assert banned_phrase not in stored_text, f"Banned narrative phrase {banned_phrase!r} leaked into a stored row: {narrative_row}"
+    assert len(narrative_row[MONITORING_HEADERS.index("Issue")].split()) <= 8, (
+        f"Issue cell must be a short phrase, not the narrative paragraph: {narrative_row}"
+    )
+    print("OK: none of the banned narrative phrases end up in a stored Sheet row; Issue stays a short phrase.\n")
+
+    print("=== Test 49: get_business_dashboard's computation path never writes to Google Sheets ===")
+    import inspect
+    import sheets_service
+
+    dashboard_source = inspect.getsource(srv.get_business_dashboard) + inspect.getsource(build_dashboard)
+    write_function_names = ("append_unique_rows", "upsert_row_by_key", "ensure_tab")
+    for write_fn in write_function_names:
+        assert write_fn not in dashboard_source, (
+            f"get_business_dashboard's code path must never call {write_fn!r} - it is read-only"
+        )
+    # build_dashboard itself only ever takes rows already read by the
+    # caller - it has no `service`/spreadsheet_id parameter to write with.
+    assert "service" not in inspect.signature(build_dashboard).parameters
+    print("OK: get_business_dashboard's entire code path is free of any Sheets write call, by construction.\n")
 
     print("All dashboard tests passed.")

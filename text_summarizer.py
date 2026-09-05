@@ -24,6 +24,32 @@ detected in the source, or a truncation of the original text.
 
 import re
 
+# Explicitly banned narrative/hedging phrases (per the project's storage
+# rules) that must never survive into a stored cell - regardless of where
+# in the sentence they appear, regardless of whether a domain signal
+# phrase also matches, and regardless of whether the text is otherwise
+# already short enough to pass through unchanged. Claude's own narrative
+# explanation can use language like this; Google Sheets never should.
+# Each phrase also consumes an immediately-following connective word
+# ("because"/"since") so the removal doesn't leave a dangling conjunction.
+_NARRATIVE_PHRASE_RE = re.compile(
+    r"\b(?:"
+    r"worth\s+flagging|worth\s+checking|"
+    r"this\s+is\s+important\s+because|"
+    r"cannot\s+be\s+confirmed|can.?t\s+be\s+confirmed|"
+    r"if\s+you\s+want|"
+    r"the\s+tool\s+couldn.?t|the\s+tool\s+could\s+not"
+    r")\b,?\s*(?:because|since)?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_narrative_phrases(text: str) -> str:
+    if not _NARRATIVE_PHRASE_RE.search(text):
+        return text
+    cleaned = re.sub(r"\s+", " ", _NARRATIVE_PHRASE_RE.sub(" ", text)).strip(" .,;:—–-")
+    return cleaned or text.strip()
+
 
 def shorten(text: str, signal_fn=None, concise_words: int = 12, truncate_words: int = 8) -> str:
     """Shorten `text` for a sheet cell.
@@ -33,7 +59,7 @@ def shorten(text: str, signal_fn=None, concise_words: int = 12, truncate_words: 
     """
     if not text:
         return ""
-    text = text.strip()
+    text = _strip_narrative_phrases(text.strip())
     words = text.split()
     if len(words) <= concise_words:
         return text
