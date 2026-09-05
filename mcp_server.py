@@ -1,4 +1,5 @@
 import os
+from datetime import date
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
@@ -123,24 +124,33 @@ service = build(
 # ACCOUNTING_TAB exist for this tool's body to use.
 
 def _fmt_rupees(value) -> str:
+    # "Unavailable" (never a fabricated "n/a"/"₹0") when a KPI genuinely
+    # cannot be computed from the current data - an owner-facing figure
+    # must never silently read as zero when it's actually just unknown.
     if value is None:
-        return "n/a"
+        return "Unavailable"
     return f"₹{value:,}"
 
 
 def _needs_attention_bullets(items: list) -> list:
+    """Each bullet is WHAT happened -> WHY it matters -> WHAT should happen
+    next, e.g. "055 MediTech — inverter trips increasing — confirm root
+    cause" - no priority tag, no "Action:" label, no extra commentary.
+    WHAT is the row's Site/Entity, WHY is its Issue/Description text
+    (both straight from the sheet, never invented), ACTION is its own
+    Next Action/Recommended Action cell when the sheet has one.
+    """
     if not items:
         return ["Nothing needs attention right now."]
     bullets = []
     for item in items:
         label = item.get("label") or item.get("source") or "(unlabeled)"
-        detail = item.get("detail") or ""
-        line = f"{label} — {detail}" if detail else label
-        if item.get("priority"):
-            line += f" (Priority: {item['priority']})"
+        parts = [label]
+        if item.get("detail"):
+            parts.append(item["detail"])
         if item.get("action"):
-            line += f" — Action: {item['action']}"
-        bullets.append(line)
+            parts.append(item["action"])
+        bullets.append(" — ".join(parts))
     return bullets
 
 
@@ -180,39 +190,52 @@ def _patterns_risks_bullets(patterns: list) -> list:
 
 
 def _required_actions_bullets(actions: list) -> list:
+    """Each bullet is "[specific action] — [responsible person/team]",
+    the responsible party included ONLY when the sheet's own Vendor cell
+    actually names one (never invented) - otherwise just the action.
+    """
     if not actions:
         return ["No outstanding actions right now."]
     bullets = []
     for a in actions:
         label = a.get("label") or a.get("source") or "(unlabeled)"
-        line = f"{label}: {a.get('action', '')}"
-        if a.get("priority"):
-            line += f" (Priority: {a['priority']})"
-        bullets.append(line)
+        action_text = a.get("action", "")
+        specific_action = f"{label}: {action_text}" if action_text else label
+        responsible = a.get("vendor") or ""
+        bullets.append(f"{specific_action} — {responsible}" if responsible else specific_action)
     return bullets
 
 
-def _dashboard_summary_lines(dashboard: dict) -> list:
+def _dashboard_summary_lines(dashboard: dict, today_str: str) -> list:
     """Builds get_business_dashboard's plain-text response as a pure
-    function of already-computed data (no Sheets access, no ctx, no
-    server clock) - kept separate from the tool function itself purely so
-    this text-composition logic can be unit tested directly.
+    function of already-computed data (no Sheets access, no ctx) - kept
+    separate from the tool function itself purely so this text-
+    composition logic can be unit tested directly.
 
-    This is WORKFLOW 2 (owner dashboard) output ONLY - it must always
-    render EXACTLY the fixed structure: Executive Overview / Needs My
-    Attention / What Changed / Patterns & Risks / Required Actions,
-    followed by the "[Interactive Dashboard]" marker. No introductory
-    paragraph, no concluding paragraph, no narrative commentary ("Fresh
-    pull...", "Done...", "worth flagging...", "if you want...", etc.) -
-    every line must be one of the fixed headings or a concise data bullet.
+    This is WORKFLOW 2 (owner dashboard) output ONLY, written as a concise
+    EXECUTIVE BRIEFING - not a developer/analyst conversation. It must
+    always render EXACTLY the fixed structure: **Executive Overview** /
+    **Needs My Attention** / **What Changed** / **Patterns & Risks** /
+    **Required Actions**, followed by the "**[Interactive Dashboard]**"
+    marker. No introductory paragraph, no concluding paragraph, no
+    conversational commentary ("Done...", "worth flagging...", "if you
+    want...", "Want me to...", "the dashboard shows...", explanations of
+    how the MCP/Sheets/date gaps work, or a question back to the owner) -
+    every line is one of the fixed headings or a concise, factual bullet.
 
-    The Executive Overview heading always states the actual latest report
-    date on record ("as of DD.MM.YYYY") rather than the server's current
-    date - so it can never imply today's data is being shown when the
-    latest real report is from an earlier day. Built entirely from the
-    already-computed dashboard sections (needs_attention, what_changed,
-    patterns_risks, required_actions) - never the raw 10-column row data,
-    which stays one click away in the interactive dashboard's detail view.
+    `today_str` is the ONE deliberate, narrow use of the server clock in
+    this project - purely to decide whether the Executive Overview heading
+    needs a "(latest available: DD.MM.YYYY)" qualifier (when the most
+    recent report on record isn't from today) or can stand bare (when it
+    is, or when there's no data to compare at all). This never relabels,
+    rewrites, or stands in for a row's actual date - every figure below
+    still comes straight from the sheet's own latest-dated rows - and the
+    date discrepancy is never discussed anywhere else in the response.
+
+    Built entirely from the already-computed dashboard sections
+    (needs_attention, what_changed, patterns_risks, required_actions) -
+    never the raw 10-column row data, which stays one click away in the
+    interactive dashboard's detail view.
     """
     overview = dashboard["overview"]
     what_changed = dashboard["what_changed"]
@@ -220,39 +243,45 @@ def _dashboard_summary_lines(dashboard: dict) -> list:
     accounting_date = what_changed.get("accounting_date") or ""
     latest_date = monitoring_date or accounting_date
 
-    lines = []
-    lines.append(f"Executive Overview (as of {latest_date})" if latest_date else "Executive Overview (no reports on record yet)")
+    if latest_date and latest_date != today_str:
+        overview_heading = f"**Executive Overview (latest available: {latest_date})**"
+    else:
+        overview_heading = "**Executive Overview**"
+
+    lines = [overview_heading]
     lines.append(f"- Open Issues: {overview['total_open_issues']}")
     lines.append(f"- Critical/High: {overview['critical_high_issues']}")
+    lines.append(f"- Accounting Exceptions: {overview['accounting_exceptions']}")
     if overview.get("has_accounting_data"):
-        lines.append(f"- Accounting Exceptions: {overview['accounting_exceptions']}")
         lines.append(f"- Sales: {_fmt_rupees(overview['sales_total'])}")
         lines.append(f"- Purchases: {_fmt_rupees(overview['purchase_total'])}")
         lines.append(f"- Payments: {_fmt_rupees(overview.get('payments_total'))}")
     else:
-        # Never a bare "₹0" here - a sum over zero rows and a sum of real
-        # zero-value rows both come out to 0, and only this explicit line
-        # tells them apart.
-        lines.append("- Accounting: no accounting data available for this date.")
+        # Never a bare "₹0"/"Sales: ₹0" here - a sum over zero rows and a
+        # sum of real zero-value rows both come out to 0, and this is the
+        # only way to tell "no report submitted" apart from "zero activity".
+        lines.append("- Sales: No accounting data")
+        lines.append("- Purchases: No accounting data")
+        lines.append("- Payments: No accounting data")
 
     lines.append("")
-    lines.append("Needs My Attention")
+    lines.append("**Needs My Attention**")
     lines.extend(f"- {b}" for b in _needs_attention_bullets(dashboard["needs_attention"]))
 
     lines.append("")
-    lines.append("What Changed")
+    lines.append("**What Changed**")
     lines.extend(f"- {b}" for b in _what_changed_bullets(what_changed))
 
     lines.append("")
-    lines.append("Patterns & Risks")
+    lines.append("**Patterns & Risks**")
     lines.extend(f"- {b}" for b in _patterns_risks_bullets(dashboard["patterns_risks"]))
 
     lines.append("")
-    lines.append("Required Actions")
+    lines.append("**Required Actions**")
     lines.extend(f"- {b}" for b in _required_actions_bullets(dashboard["required_actions"]))
 
     lines.append("")
-    lines.append("[Interactive Dashboard]")
+    lines.append("**[Interactive Dashboard]**")
 
     return lines
 
@@ -274,12 +303,20 @@ def get_business_dashboard(ctx: Context) -> CallToolResult:
     calls any Sheets-write function - Google Sheets remains the single
     source of truth, nothing is cached or written back.
 
-    The textual response ALWAYS follows EXACTLY this fixed structure, with
-    NO introductory paragraph and NO concluding paragraph - no "Fresh
-    pull...", "Done...", "worth flagging...", "if you want...", "the
-    dashboard above...", or similar narrative:
+    The textual response is a concise EXECUTIVE BRIEFING for the company
+    owner - not a developer/analyst explaining the system, not a
+    conversational assistant, never a question back to the owner. It
+    ALWAYS follows EXACTLY this fixed structure, with NO introductory
+    paragraph and NO concluding paragraph - no "Done...", "worth
+    flagging...", "worth checking...", "if you want...", "Want me to...",
+    "I can...", "the dashboard shows/above...", "current state...",
+    explanations of how the MCP/Sheets/report uploads/date gaps work, or
+    any other narrative/developer/debug commentary:
 
-        Executive Overview (as of DD.MM.YYYY)
+        **Executive Overview** (or **Executive Overview (latest
+        available: DD.MM.YYYY)** when the most recent report on record
+        isn't from today - the date discrepancy is stated ONLY here,
+        nowhere else in the response)
         - Open Issues: X
         - Critical/High: X
         - Accounting Exceptions: X
@@ -287,28 +324,29 @@ def get_business_dashboard(ctx: Context) -> CallToolResult:
         - Purchases: ₹X
         - Payments: ₹X
 
-        Needs My Attention
-        - concise item
+        **Needs My Attention**
+        - [WHAT] — [WHY IT MATTERS] — [WHAT SHOULD HAPPEN NEXT]
 
-        What Changed
-        - concise item
+        **What Changed**
+        - concise, meaningful business change
 
-        Patterns & Risks
-        - concise item
+        **Patterns & Risks**
+        - concise pattern/risk actually supported by the data
 
-        Required Actions
-        - concise item
+        **Required Actions**
+        - [specific action] — [responsible person/team, only if the sheet
+          actually names one - never invented]
 
-        [Interactive Dashboard]
+        **[Interactive Dashboard]**
 
-    The Executive Overview heading always states the actual latest report
-    date on record (never the server's clock), so it can never imply
-    today's data is shown when the latest real report is from an earlier
-    day. It never prints a bare "0" for Sales/Purchases/Payments when
-    Accounting simply has no rows for that date - see "no accounting data
-    available for this date" vs. a real computed 0. None of the five
-    sections ever expose raw 10-column row data in this text - that detail
-    stays one click away in the interactive dashboard.
+    It never prints "Sales: ₹0"/"Purchases: ₹0"/"Payments: ₹0" when
+    Accounting simply has no rows for the displayed date - see "No
+    accounting data" vs. a real computed ₹0 - and never implies missing
+    data means zero business activity. A figure that genuinely cannot be
+    computed is shown as "Unavailable" rather than omitted-as-commentary
+    or fabricated as 0. None of the five sections ever expose raw
+    10-column row data in this text - that detail stays one click away in
+    the interactive dashboard, unchanged by any of this.
 
     On an MCP Apps-capable client the interactive dashboard also renders
     inline in the chat, with its own Refresh button that re-calls this
@@ -318,7 +356,7 @@ def get_business_dashboard(ctx: Context) -> CallToolResult:
     accounting_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
     dashboard = build_dashboard(monitoring_rows, accounting_rows)
 
-    summary_lines = _dashboard_summary_lines(dashboard)
+    summary_lines = _dashboard_summary_lines(dashboard, date.today().strftime("%d.%m.%Y"))
 
     return CallToolResult(
         content=[TextContent(type="text", text="\n".join(summary_lines))],

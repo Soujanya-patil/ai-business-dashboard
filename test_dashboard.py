@@ -598,77 +598,94 @@ if __name__ == "__main__":
     assert real_zero_dashboard["overview"]["sales_total"] == 0
     print("OK: both cases compute sales_total=0, but only has_accounting_data tells them apart.\n")
 
-    print("=== Test 43: the no-data-vs-zero distinction reaches dashboard_app.html and the text summary ===")
+    print("=== Test 43: 'No accounting data' (per-line) is distinguished from a real computed ₹0, in the text response ===")
     assert "has_accounting_data" in html_text, "dashboard_app.html must read the has_accounting_data flag"
     assert "No accounting data available for this date." in html_text
-    no_acc_lines = srv._dashboard_summary_lines(no_data_dashboard)
-    assert any("no accounting data available for this date" in line.lower() for line in no_acc_lines), no_acc_lines
+    no_acc_lines = srv._dashboard_summary_lines(no_data_dashboard, "03.09.2026")
+    assert "- Sales: No accounting data" in no_acc_lines, no_acc_lines
+    assert "- Purchases: No accounting data" in no_acc_lines, no_acc_lines
+    assert "- Payments: No accounting data" in no_acc_lines, no_acc_lines
     assert not any("sales: ₹0" in line.lower() or "sales: 0" in line.lower() for line in no_acc_lines), (
         f"Must never print a bare 0/₹0 for Sales when there is no Accounting data at all: {no_acc_lines}"
     )
-    real_zero_lines = srv._dashboard_summary_lines(real_zero_dashboard)
+    assert not any("no business activity" in line.lower() for line in no_acc_lines), (
+        "Must never imply missing data means zero business activity"
+    )
+    real_zero_lines = srv._dashboard_summary_lines(real_zero_dashboard, "03.09.2026")
     assert any(line.strip() == "- Sales: ₹0" for line in real_zero_lines), (
         f"A real computed 0 (from an actual Sale row) must still be shown as 0: {real_zero_lines}"
     )
-    print("OK: dashboard_app.html and the MCP text response both distinguish no-data from a real zero.\n")
+    print("OK: the MCP text response distinguishes no-data (per Sales/Purchases/Payments line) from a real zero.\n")
 
-    print("=== Test 44: _dashboard_summary_lines always labels the Executive Overview with the ACTUAL report date ===")
+    print("=== Test 44: the Executive Overview heading only carries the staleness qualifier when 'today' isn't on record ===")
     current_dashboard = build_dashboard(
         [MON_HEADER, ["05.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
         [ACC_HEADER],
     )
-    current_lines = srv._dashboard_summary_lines(current_dashboard)
-    assert "Executive Overview (as of 05.09.2026)" in current_lines, current_lines
+    current_lines = srv._dashboard_summary_lines(current_dashboard, "05.09.2026")
+    assert "**Executive Overview**" in current_lines, current_lines
+    assert not any("latest available" in line.lower() for line in current_lines), (
+        "Must not show the staleness qualifier when the latest report on record IS today's date"
+    )
 
     stale_dashboard = build_dashboard(
         [MON_HEADER, ["03.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
         [ACC_HEADER],
     )
-    stale_lines = srv._dashboard_summary_lines(stale_dashboard)
-    assert "Executive Overview (as of 03.09.2026)" in stale_lines, (
-        "The Executive Overview must be labelled with the actual latest report date on record"
+    stale_lines = srv._dashboard_summary_lines(stale_dashboard, "05.09.2026")
+    assert "**Executive Overview (latest available: 03.09.2026)**" in stale_lines, stale_lines
+    assert not any(line.strip() == "**Executive Overview**" for line in stale_lines), (
+        "Must not present the heading as bare/current when the latest report on record is stale"
     )
-    # No comparison against the server clock at all - the heading always
-    # states the real data date, so it can never falsely imply the data is
-    # from "today" (whatever today happens to be) when it isn't.
+    # The date discrepancy is stated ONLY via the heading qualifier - never
+    # a separate conversational sentence mentioning "today".
     assert not any("today" in line.lower() for line in stale_lines), (
-        f"Must never claim data is from 'today' - only ever state the actual report date: {stale_lines}"
+        f"The date gap must never be discussed in a separate sentence: {stale_lines}"
     )
-    print("OK: the response always states the real report date and never claims it's 'today's' data.\n")
+    print("OK: the heading states 'today's data' bare only when it's actually today's, "
+          "and states the real latest date otherwise - nowhere else.\n")
 
-    print("=== Test 45: no developer/debug language in the normal owner-facing response ===")
-    for banned in ("almost certainly", "doesn't look wired", "unverified", "test submissions", "test_connection", "unreliable"):
-        assert banned not in " ".join(current_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
-        assert banned not in " ".join(stale_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
-    print("OK: the response text is factual and free of developer/debug language.\n")
+    print("=== Test 45: no developer/debug/conversational language in the normal owner-facing response ===")
+    for banned in (
+        "almost certainly", "doesn't look wired", "unverified", "test submissions",
+        "test_connection", "unreliable", "the data came from", "from other sessions",
+        "current state", "cumulative picture",
+    ):
+        assert banned not in " ".join(current_lines).lower(), f"Found debug/conversational language {banned!r} in the owner-facing response"
+        assert banned not in " ".join(stale_lines).lower(), f"Found debug/conversational language {banned!r} in the owner-facing response"
+    print("OK: the response text is factual and free of developer/debug/conversational language.\n")
 
-    print("=== Test 46: the owner-facing response uses EXACTLY the fixed structure - no intro/outro narrative ===")
+    print("=== Test 46: the owner-facing response uses EXACTLY the fixed structure (bold headings) - no intro/outro narrative ===")
     for lines in (stale_lines, no_acc_lines, current_lines):
-        assert lines[0].startswith("Executive Overview"), (
-            f"Response must start directly with Executive Overview - no introductory paragraph: {lines}"
+        assert lines[0].startswith("**Executive Overview"), (
+            f"Response must start directly with **Executive Overview** - no introductory paragraph: {lines}"
         )
-        assert lines[-1] == "[Interactive Dashboard]", (
-            f"Response must end with the interactive dashboard marker - no concluding paragraph: {lines}"
+        assert lines[-1] == "**[Interactive Dashboard]**", (
+            f"Response must end with the bold interactive dashboard marker - no concluding paragraph: {lines}"
         )
-        for heading in ("Executive Overview", "Needs My Attention", "What Changed", "Patterns & Risks", "Required Actions"):
-            assert any(line == heading or line.startswith(heading + " (") for line in lines), (
+        for heading in ("**Executive Overview", "**Needs My Attention**", "**What Changed**", "**Patterns & Risks**", "**Required Actions**"):
+            assert any(line.startswith(heading) for line in lines), (
                 f"Missing required section heading {heading!r}: {lines}"
             )
         joined = " ".join(lines).lower()
         for banned_phrase in (
             "ai business dashboard (live", "does not support the mcp apps",
             "fresh pull", "done —", "done -", "worth flagging", "worth checking",
-            "if you want", "the dashboard above", "this matches", "nothing suspicious",
-            "no changes since the last pull", "since the master issue tracker",
+            "if you want", "want me to", "i can ", "the dashboard shows", "the dashboard above",
+            "this matches", "nothing suspicious", "no changes since the last pull",
+            "since the master issue tracker", "master issue tracker hasn't been uploaded",
+            "the data came from", "from other sessions", "current state", "cumulative picture",
         ):
             assert banned_phrase not in joined, f"Found banned intro/outro/narrative text {banned_phrase!r}: {lines}"
+        # No question back to the owner anywhere in the response.
+        assert not joined.rstrip().endswith("?"), f"Response must never end with a question to the owner: {lines}"
     # The raw 10-column data must never appear in the text response - only
     # in the interactive dashboard's detail view (see Test 35).
     assert not any("Days Open" in line or "Vendor" in line or "Risk / Tax Flag" in line for line in stale_lines), (
         "The text response must never dump raw column data - it stays one click away in the interactive dashboard"
     )
-    print("OK: EXACTLY Executive Overview / Needs My Attention / What Changed / Patterns & Risks / Required Actions / ")
-    print("    [Interactive Dashboard] - never a bare intro or concluding paragraph.\n")
+    print("OK: EXACTLY **Executive Overview** / **Needs My Attention** / **What Changed** / **Patterns & Risks** / ")
+    print("    **Required Actions** / **[Interactive Dashboard]** - never a bare intro or concluding paragraph.\n")
 
     print("=== Test 47: employee report narrative extraction - the exact worked examples from the spec ===")
     from summary_parser import parse_monitoring_summary, build_monitoring_rows
@@ -740,5 +757,39 @@ if __name__ == "__main__":
     # caller - it has no `service`/spreadsheet_id parameter to write with.
     assert "service" not in inspect.signature(build_dashboard).parameters
     print("OK: get_business_dashboard's entire code path is free of any Sheets write call, by construction.\n")
+
+    print("=== Test 50: Needs My Attention renders EXACTLY 'WHAT — WHY IT MATTERS — ACTION' (executive tone, no clutter) ===")
+    na_dashboard = build_dashboard(
+        [MON_HEADER, [
+            "05.09.2026", "055 MediTech", "Inverter tripping increasing", "Inverter",
+            "Critical", "Open", "2", "", "Confirm root cause", "",
+        ]],
+        [ACC_HEADER],
+    )
+    na_lines = srv._dashboard_summary_lines(na_dashboard, "05.09.2026")
+    assert "- 055 MediTech — Inverter tripping increasing — Confirm root cause" in na_lines, na_lines
+    assert not any("(priority" in line.lower() or "— action:" in line.lower() for line in na_lines), (
+        f"Needs My Attention bullets must be plain WHAT — WHY — ACTION, no '(Priority: ...)' tag or 'Action:' label: {na_lines}"
+    )
+    print("OK: Needs My Attention is exactly WHAT — WHY IT MATTERS — ACTION, nothing else appended.\n")
+
+    print("=== Test 51: Required Actions renders '[specific action] — [responsible]' ONLY when a vendor is actually known ===")
+    ra_dashboard = build_dashboard(
+        [MON_HEADER,
+         ["05.09.2026", "079 Oaza Global", "Optimizer failures", "Optimizer", "High", "Open", "3", "", "Replace optimizer", "SolarTech Services"],
+         ["05.09.2026", "Site Z", "Outage", "Outage", "Critical", "Open", "1", "", "", ""],
+         ],
+        [ACC_HEADER],
+    )
+    ra_lines = srv._dashboard_summary_lines(ra_dashboard, "05.09.2026")
+    assert "- 079 Oaza Global: Replace optimizer — SolarTech Services" in ra_lines, (
+        f"A Vendor cell actually present in the sheet must be surfaced as the responsible party: {ra_lines}"
+    )
+    # Site Z has no Vendor cell at all - the bullet must be the action ONLY,
+    # never a fabricated/invented responsible party.
+    assert "- Site Z: Review — Critical priority" in ra_lines, (
+        f"No responsible party must be invented when the sheet doesn't name one: {ra_lines}"
+    )
+    print("OK: Required Actions names a responsible party only when the sheet's own Vendor cell actually has one.\n")
 
     print("All dashboard tests passed.")

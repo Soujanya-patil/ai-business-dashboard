@@ -685,6 +685,10 @@ def _build_required_actions(monitoring: list[dict[str, str]], accounting: list[d
             "action": next_action or f"Review — {priority} priority",
             "priority": priority,
             "status": r.get("Status", ""),
+            # Straight from the row's own Vendor cell - the only field in
+            # the schema that names a responsible external party. Blank
+            # when the sheet doesn't have one; never invented.
+            "vendor": r.get("Vendor", ""),
         })
 
     for r in accounting:
