@@ -11,6 +11,7 @@
     --text: light-dark(#20201e, #f0efec);
     --text-muted: light-dark(#6b6a66, #a3a29d);
     --accent: light-dark(#c15f3c, #e08a63);
+    --accent-bg: light-dark(#fbeee7, #3a2a22);
     --critical: #c0392b;
     --high: #d68910;
     --medium: #7d8c4a;
@@ -30,7 +31,7 @@
   }
   h1 { font-size: 16px; margin: 0; }
   h2 { font-size: 13px; margin: 0 0 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .04em; }
-  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
   .meta { font-size: 11px; color: var(--text-muted); }
   button {
     font: inherit; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--border);
@@ -38,32 +39,68 @@
   }
   button:hover { border-color: var(--accent); }
   button:disabled { opacity: .5; cursor: default; }
+
+  .tabbar { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tabbar button {
+    border: none; border-radius: 0; background: transparent; padding: 8px 4px; margin-right: 16px;
+    font-weight: 600; color: var(--text-muted); border-bottom: 2px solid transparent; position: relative; top: 1px;
+  }
+  .tabbar button:hover { color: var(--text); border-color: var(--border); }
+  .tabbar button.active { color: var(--accent); border-bottom-color: var(--accent); }
+
   .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .kpis-compact { grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); margin-bottom: 10px; }
   .kpi { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
   .kpi .value { font-size: 22px; font-weight: 600; }
+  .kpis-compact .kpi .value { font-size: 17px; }
   .kpi .label { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
   @media (max-width: 640px) { .grid2 { grid-template-columns: 1fr; } }
   .card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 14px; }
+  .tablewrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--border); vertical-align: top; white-space: nowrap; }
+  td { white-space: normal; }
   th { color: var(--text-muted); font-weight: 500; }
-  tr:last-child td { border-bottom: none; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text); }
+  tr:last-child > td { border-bottom: none; }
   .empty { color: var(--text-muted); font-style: italic; padding: 6px 0; }
+  .empty-panel {
+    color: var(--text-muted); font-style: italic; text-align: center; padding: 28px 12px;
+    border: 1px dashed var(--border); border-radius: 8px;
+  }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #fff; }
   .pill.Critical { background: var(--critical); }
   .pill.High { background: var(--high); }
   .pill.Medium { background: var(--medium); }
   .pill.Low { background: var(--low); }
-  .status { font-size: 11px; font-weight: 600; }
+  .status { font-size: 11px; font-weight: 600; white-space: nowrap; }
   .status.Open { color: var(--open); }
   .status.Resolved { color: var(--resolved); }
   .status.Unconfirmed { color: var(--unconfirmed); }
+  .status.Pending { color: var(--unconfirmed); }
   .status.Monitoring { color: var(--text-muted); }
   .chipbar { display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; font-size: 11px; }
   .chip b { color: var(--text); }
   .sourcebadge { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-muted); }
+
+  .filterbar { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; margin-bottom: 12px; }
+  .filter { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--text-muted); }
+  .filter select {
+    font: inherit; font-size: 12px; padding: 5px 6px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--card-bg); color: var(--text); min-width: 120px;
+  }
+  .clickable-row { cursor: pointer; }
+  .clickable-row:hover > td { background: var(--accent-bg); }
+  .detail-row > td { background: var(--bg); padding: 10px 12px; }
+  .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px 16px; white-space: normal; }
+  .detail-field { display: flex; flex-direction: column; gap: 2px; }
+  .detail-label { font-size: 10px; text-transform: uppercase; letter-spacing: .03em; color: var(--text-muted); }
+  .detail-value { font-size: 12px; }
+  .resultcount { color: var(--text-muted); margin-top: 8px; }
+
   #root.loading { opacity: .5; }
   #error { color: var(--critical); padding: 8px 0; display: none; }
 </style>
@@ -77,6 +114,11 @@
     </div>
   </div>
   <div id="error"></div>
+  <div class="tabbar" id="tabbar">
+    <button data-tab="overview" class="active">Overview</button>
+    <button data-tab="monitoring">Monitoring</button>
+    <button data-tab="accounting">Accounting</button>
+  </div>
   <div id="root" class="loading">
     <div class="empty">Waiting for dashboard data…</div>
   </div>
@@ -208,6 +250,24 @@
     el.style.display = message ? "block" : "none";
   }
 
+  // ---- Interactive UI state -----------------------------------------------
+  // Every dashboard invocation delivers a FRESH structuredContent payload
+  // (see render() at the bottom) - `state.data` is just the most recently
+  // received copy, held only so tab-switching/filtering/sorting can
+  // re-render instantly without another round trip. It is replaced
+  // wholesale on every refresh/tool-result, never merged or persisted -
+  // Google Sheets stays the only place this data actually lives.
+  var state = {
+    data: null,
+    tab: "overview",
+    monFilters: { date: "", priority: "", status: "", category: "" },
+    monSort: { col: "date", dir: "desc" },
+    monExpanded: null,
+    accFilters: { date: "", record_type: "", priority: "", status: "" },
+    accSort: { col: "date", dir: "desc" },
+    accExpanded: null,
+  };
+
   // ---- Rendering ---------------------------------------------------------
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -238,10 +298,66 @@
     }
     var head = "<tr>" + headers.map(function (h) { return "<th>" + esc(h) + "</th>"; }).join("") + "</tr>";
     var body = rows.map(function (r) { return "<tr>" + rowToCells(r).join("") + "</tr>"; }).join("");
-    return "<table>" + head + body + "</table>";
+    return '<div class="tablewrap"><table>' + head + body + "</table></div>";
   }
 
   function td(v) { return "<td>" + esc(v) + "</td>"; }
+
+  function kpi(value, label) {
+    return '<div class="kpi"><div class="value">' + esc(value) + '</div><div class="label">' + esc(label) + "</div></div>";
+  }
+
+  function chipbar(counts) {
+    var keys = Object.keys(counts || {});
+    if (keys.length === 0) return '<div class="empty">None.</div>';
+    return (
+      '<div class="chipbar">' +
+      keys.map(function (k) { return '<div class="chip"><b>' + esc(counts[k]) + "</b> " + esc(k) + "</div>"; }).join("") +
+      "</div>"
+    );
+  }
+
+  function emptyPanel(message) {
+    return '<div class="empty-panel">' + esc(message) + "</div>";
+  }
+
+  // DD.MM.YYYY -> a comparable number (YYYYMMDD). Never assumes/derives
+  // "today" - purely reorders whatever date strings are actually present.
+  function dateSortKey(s) {
+    if (!s) return 0;
+    var parts = String(s).split(".");
+    if (parts.length !== 3) return 0;
+    var d = parseInt(parts[0], 10), m = parseInt(parts[1], 10), y = parseInt(parts[2], 10);
+    if (isNaN(d) || isNaN(m) || isNaN(y)) return 0;
+    return y * 10000 + m * 100 + d;
+  }
+
+  var PRIORITY_ORDER = { Critical: 0, High: 1, Medium: 2, Low: 3 };
+  function priorityRank(p) {
+    return PRIORITY_ORDER.hasOwnProperty(p) ? PRIORITY_ORDER[p] : 4;
+  }
+
+  function distinctValues(records, field) {
+    var seen = {};
+    records.forEach(function (r) { if (r[field]) seen[r[field]] = true; });
+    return Object.keys(seen).sort();
+  }
+
+  function sortIndicator(col, sortState) {
+    if (sortState.col !== col) return "";
+    return sortState.dir === "asc" ? " ↑" : " ↓";
+  }
+
+  function filterSelectHtml(filterKey, label, options, current) {
+    var opts = '<option value="">All</option>' +
+      options.map(function (o) {
+        return '<option value="' + esc(o) + '"' + (o === current ? " selected" : "") + ">" + esc(o) + "</option>";
+      }).join("");
+    return (
+      '<label class="filter"><span>' + esc(label) + '</span>' +
+      '<select data-filter="' + esc(filterKey) + '">' + opts + "</select></label>"
+    );
+  }
 
   function renderOverview(o) {
     var cash = o.cash_position || {};
@@ -258,48 +374,6 @@
       (cashClosing ? kpi(fmtAmount(cashClosing), "Cash Balance (" + esc(cash.as_of || "") + ")") : "") +
       "</div>"
     );
-  }
-
-  function kpi(value, label) {
-    return '<div class="kpi"><div class="value">' + esc(value) + '</div><div class="label">' + esc(label) + "</div></div>";
-  }
-
-  function chipbar(counts) {
-    var keys = Object.keys(counts || {});
-    if (keys.length === 0) return '<div class="empty">None.</div>';
-    return (
-      '<div class="chipbar">' +
-      keys.map(function (k) { return '<div class="chip"><b>' + esc(counts[k]) + "</b> " + esc(k) + "</div>"; }).join("") +
-      "</div>"
-    );
-  }
-
-  function renderMonitoring(m) {
-    var html = "";
-    html += '<div class="card"><h2>Priority Breakdown</h2>' + chipbar(m.by_priority) + "</div>";
-    html += '<div class="card"><h2>Issue Categories</h2>' + chipbar(m.by_category) + "</div>";
-    html += '<div class="card"><h2>Sites Needing Attention</h2>' + table(
-      ["Site", "Issue", "Priority", "Status", "Days Open"],
-      m.sites_needing_attention,
-      function (r) { return [td(r.site), td(r.issue), "<td>" + pill(r.priority) + "</td>", "<td>" + statusTag(r.status) + "</td>", td(r.days_open)]; },
-      "No open sites currently need attention."
-    ) + "</div>";
-    html += '<div class="card"><h2>Recent Actions Taken</h2>' + table(
-      ["Date", "Site", "Action Taken"],
-      m.recent_actions,
-      function (r) { return [td(r.date), td(r.site), td(r.action_taken)]; },
-      "No actions recorded yet."
-    ) + "</div>";
-    html += '<div class="card"><h2>Next Actions</h2>' + table(
-      ["Date", "Site", "Next Action"],
-      m.recent_next_actions,
-      function (r) { return [td(r.date), td(r.site), td(r.next_action)]; },
-      "No pending next actions."
-    ) + "</div>";
-    if (m.open_issues_trend && m.open_issues_trend.length > 1) {
-      html += '<div class="card"><h2>Open Issues Trend</h2>' + sparkline(m.open_issues_trend) + "</div>";
-    }
-    return html;
   }
 
   function sparkline(points) {
@@ -320,37 +394,41 @@
     );
   }
 
-  function renderAccounting(a) {
-    var html = "";
-    html += '<div class="card"><h2>Records by Type</h2>' + chipbar(a.by_record_type) + "</div>";
-    html += '<div class="card"><h2>Amounts by Type</h2>' + chipbar(
-      Object.keys(a.amount_total_by_record_type || {}).reduce(function (acc, k) {
-        acc[k] = fmtAmount(a.amount_total_by_record_type[k]);
-        return acc;
-      }, {})
-    ) + "</div>";
-    if (a.cash_position && a.cash_position.as_of) {
-      var c = a.cash_position;
-      html += '<div class="card"><h2>Cash &amp; Bank Position (' + esc(c.as_of) + ')</h2>' + table(
-        ["Opening", "Closing", "Receipts", "Payments"],
-        [c],
-        function (r) { return [td(fmtAmount(r["Opening balance"])), td(fmtAmount(r["Closing balance"])), td(fmtAmount(r["Total receipts"])), td(fmtAmount(r["Total payments"]))]; },
-        "No cash position recorded."
-      ) + "</div>";
+  function renderMonitoringSnapshot(m) {
+    if (m.total_rows === 0) {
+      return '<div class="card"><h2>Monitoring</h2>' + emptyPanel("No monitoring data available yet.") + "</div>";
     }
-    html += '<div class="card"><h2>Tax / GST Flags</h2>' + table(
-      ["Date", "Entity", "Description", "Flag", "Status"],
-      a.tax_flags,
-      function (r) { return [td(r.date), td(r.entity), td(r.description), td(r.flag), "<td>" + statusTag(r.status) + "</td>"]; },
-      "No tax/GST flags."
-    ) + "</div>";
-    html += '<div class="card"><h2>High-Priority Exceptions</h2>' + table(
-      ["Date", "Entity", "Description", "Amount", "Priority", "Recommended Action"],
-      a.high_priority_exceptions,
-      function (r) { return [td(r.date), td(r.entity), td(r.description), td(fmtAmount(r.amount)), "<td>" + pill(r.priority) + "</td>", td(r.recommended_action)]; },
-      "No high-priority accounting exceptions."
-    ) + "</div>";
-    return html;
+    var trend = m.open_issues_trend && m.open_issues_trend.length > 1 ? sparkline(m.open_issues_trend) : "";
+    return (
+      '<div class="card"><h2>Monitoring</h2>' +
+      '<div class="kpis kpis-compact">' +
+      kpi(m.total_open_issues, "Open") +
+      kpi(m.resolved_count, "Resolved") +
+      kpi(m.critical_high_count, "Critical / High") +
+      kpi(m.total_rows, "Total") +
+      "</div>" +
+      chipbar(m.by_priority) +
+      (trend ? '<div style="margin-top:10px;">' + trend + "</div>" : "") +
+      "</div>"
+    );
+  }
+
+  function renderAccountingSnapshot(a) {
+    if (a.total_rows === 0) {
+      return '<div class="card"><h2>Accounting</h2>' + emptyPanel("No accounting data available yet.") + "</div>";
+    }
+    var cash = a.cash_position || {};
+    return (
+      '<div class="card"><h2>Accounting</h2>' +
+      '<div class="kpis kpis-compact">' +
+      kpi(fmtAmount(a.sales_total), "Sales") +
+      kpi(fmtAmount(a.purchase_total), "Purchase") +
+      kpi(a.pending_items.length, "Pending") +
+      (cash.as_of ? kpi(fmtAmount(cash["Closing balance"]), "Cash (" + esc(cash.as_of) + ")") : "") +
+      "</div>" +
+      chipbar(a.by_record_type) +
+      "</div>"
+    );
   }
 
   function renderNeedsAttention(items) {
@@ -387,21 +465,231 @@
     return '<div class="grid2"><div><h2>Monitoring</h2>' + mon + "</div><div><h2>Accounting</h2>" + acc + "</div></div>";
   }
 
+  function renderOverviewTab(data) {
+    return (
+      renderOverview(data.overview) +
+      '<div class="grid2">' + renderMonitoringSnapshot(data.monitoring) + renderAccountingSnapshot(data.accounting) + "</div>" +
+      '<div class="card"><h2>Priority &amp; Attention</h2>' + renderNeedsAttention(data.needs_attention) + "</div>" +
+      '<div class="card"><h2>Recent Activity</h2>' + renderRecentActivity(data.recent_activity) + "</div>"
+    );
+  }
+
+  // ---- Monitoring tab: filter + sort + click-to-inspect -------------------
+  var MON_COLUMNS = [
+    ["date", "Date"], ["site", "Site"], ["issue", "Issue"], ["category", "Category"],
+    ["priority", "Priority"], ["status", "Status"], ["days_open", "Days Open"],
+    ["action_taken", "Action Taken"], ["next_action", "Next Action"], ["vendor", "Vendor"],
+  ];
+
+  function monComparator(col) {
+    if (col === "date") return function (a, b) { return dateSortKey(a.date) - dateSortKey(b.date); };
+    if (col === "priority") return function (a, b) { return priorityRank(a.priority) - priorityRank(b.priority); };
+    if (col === "days_open") return function (a, b) { return (parseFloat(a.days_open) || -1) - (parseFloat(b.days_open) || -1); };
+    return function (a, b) { return String(a[col] || "").localeCompare(String(b[col] || "")); };
+  }
+
+  function applyFilters(records, filters) {
+    var keys = Object.keys(filters);
+    return records.filter(function (r) {
+      return keys.every(function (k) { return !filters[k] || r[k] === filters[k]; });
+    });
+  }
+
+  function sortRecords(records, sortState, comparator) {
+    var sorted = records.slice().sort(comparator);
+    if (sortState.dir === "desc") sorted.reverse();
+    return sorted;
+  }
+
+  function renderMonDetail(r) {
+    return (
+      '<div class="detail-grid">' +
+      MON_COLUMNS.map(function (c) {
+        return (
+          '<div class="detail-field"><span class="detail-label">' + esc(c[1]) +
+          '</span><span class="detail-value">' + esc(r[c[0]] || "—") + "</span></div>"
+        );
+      }).join("") +
+      "</div>"
+    );
+  }
+
+  function renderMonitoringTab(m) {
+    if (m.total_rows === 0) {
+      return '<div class="card">' + emptyPanel("No monitoring data available yet.") + "</div>";
+    }
+
+    var filterBar =
+      '<div class="filterbar">' +
+      filterSelectHtml("date", "Date", distinctValues(m.records, "date").sort(function (a, b) { return dateSortKey(a) - dateSortKey(b); }), state.monFilters.date) +
+      filterSelectHtml("priority", "Priority", distinctValues(m.records, "priority"), state.monFilters.priority) +
+      filterSelectHtml("status", "Status", distinctValues(m.records, "status"), state.monFilters.status) +
+      filterSelectHtml("category", "Category", distinctValues(m.records, "category"), state.monFilters.category) +
+      "</div>";
+
+    var filtered = applyFilters(m.records, state.monFilters);
+    var sorted = sortRecords(filtered, state.monSort, monComparator(state.monSort.col));
+
+    var head = "<tr>" + MON_COLUMNS.map(function (c) {
+      return '<th class="sortable" data-sort-col="' + c[0] + '">' + esc(c[1]) + sortIndicator(c[0], state.monSort) + "</th>";
+    }).join("") + "</tr>";
+
+    var body;
+    if (sorted.length === 0) {
+      body = '<tr><td colspan="' + MON_COLUMNS.length + '" class="empty">No monitoring records match the selected filters.</td></tr>';
+    } else {
+      body = sorted.map(function (r, i) {
+        var row =
+          '<tr class="clickable-row" data-row-idx="' + i + '">' +
+          td(r.date) + td(r.site) + td(r.issue) + td(r.category) +
+          "<td>" + pill(r.priority) + "</td>" + "<td>" + statusTag(r.status) + "</td>" +
+          td(r.days_open) + td(r.action_taken) + td(r.next_action) + td(r.vendor) +
+          "</tr>";
+        if (state.monExpanded === i) {
+          row += '<tr class="detail-row"><td colspan="' + MON_COLUMNS.length + '">' + renderMonDetail(r) + "</td></tr>";
+        }
+        return row;
+      }).join("");
+    }
+
+    return (
+      filterBar +
+      '<div class="tablewrap"><table>' + head + body + "</table></div>" +
+      '<div class="resultcount">' + sorted.length + " of " + m.records.length + " record(s) shown" + (sorted.length ? " — click a row for details" : "") + "</div>"
+    );
+  }
+
+  // ---- Accounting tab: filter + sort + click-to-inspect --------------------
+  var ACC_COLUMNS = [
+    ["date", "Date"], ["record_type", "Record Type"], ["entity", "Entity"], ["description", "Description"],
+    ["amount", "Amount"], ["count", "Count"], ["priority", "Priority"], ["status", "Status"],
+    ["recommended_action", "Recommended Action"], ["risk_tax_flag", "Risk / Tax Flag"],
+  ];
+
+  function accComparator(col) {
+    if (col === "date") return function (a, b) { return dateSortKey(a.date) - dateSortKey(b.date); };
+    if (col === "priority") return function (a, b) { return priorityRank(a.priority) - priorityRank(b.priority); };
+    if (col === "amount" || col === "count") return function (a, b) { return (parseFloat(a[col]) || -Infinity) - (parseFloat(b[col]) || -Infinity); };
+    return function (a, b) { return String(a[col] || "").localeCompare(String(b[col] || "")); };
+  }
+
+  function renderAccDetail(r) {
+    return (
+      '<div class="detail-grid">' +
+      ACC_COLUMNS.map(function (c) {
+        var v = c[0] === "amount" ? fmtAmount(r[c[0]]) : (r[c[0]] || "—");
+        return (
+          '<div class="detail-field"><span class="detail-label">' + esc(c[1]) +
+          '</span><span class="detail-value">' + esc(v) + "</span></div>"
+        );
+      }).join("") +
+      "</div>"
+    );
+  }
+
+  function renderAccountingTab(a) {
+    if (a.total_rows === 0) {
+      return '<div class="card">' + emptyPanel("No accounting data available yet.") + "</div>";
+    }
+
+    var filterBar =
+      '<div class="filterbar">' +
+      filterSelectHtml("date", "Date", distinctValues(a.records, "date").sort(function (x, y) { return dateSortKey(x) - dateSortKey(y); }), state.accFilters.date) +
+      filterSelectHtml("record_type", "Record Type", distinctValues(a.records, "record_type"), state.accFilters.record_type) +
+      filterSelectHtml("priority", "Priority", distinctValues(a.records, "priority"), state.accFilters.priority) +
+      filterSelectHtml("status", "Status", distinctValues(a.records, "status"), state.accFilters.status) +
+      "</div>";
+
+    var filtered = applyFilters(a.records, state.accFilters);
+    var sorted = sortRecords(filtered, state.accSort, accComparator(state.accSort.col));
+
+    var head = "<tr>" + ACC_COLUMNS.map(function (c) {
+      return '<th class="sortable" data-sort-col="' + c[0] + '">' + esc(c[1]) + sortIndicator(c[0], state.accSort) + "</th>";
+    }).join("") + "</tr>";
+
+    var body;
+    if (sorted.length === 0) {
+      body = '<tr><td colspan="' + ACC_COLUMNS.length + '" class="empty">No accounting records match the selected filters.</td></tr>';
+    } else {
+      body = sorted.map(function (r, i) {
+        var row =
+          '<tr class="clickable-row" data-row-idx="' + i + '">' +
+          td(r.date) + td(r.record_type) + td(r.entity) + td(r.description) +
+          td(fmtAmount(r.amount)) + td(r.count) + "<td>" + pill(r.priority) + "</td>" +
+          "<td>" + statusTag(r.status) + "</td>" + td(r.recommended_action) + td(r.risk_tax_flag) +
+          "</tr>";
+        if (state.accExpanded === i) {
+          row += '<tr class="detail-row"><td colspan="' + ACC_COLUMNS.length + '">' + renderAccDetail(r) + "</td></tr>";
+        }
+        return row;
+      }).join("");
+    }
+
+    return (
+      filterBar +
+      '<div class="tablewrap"><table>' + head + body + "</table></div>" +
+      '<div class="resultcount">' + sorted.length + " of " + a.records.length + " record(s) shown" + (sorted.length ? " — click a row for details" : "") + "</div>"
+    );
+  }
+
+  // ---- Tab plumbing --------------------------------------------------------
+  function renderTab() {
+    if (!state.data) return;
+    var root = document.getElementById("root");
+    if (state.tab === "monitoring") root.innerHTML = renderMonitoringTab(state.data.monitoring);
+    else if (state.tab === "accounting") root.innerHTML = renderAccountingTab(state.data.accounting);
+    else root.innerHTML = renderOverviewTab(state.data);
+  }
+
+  document.querySelectorAll("#tabbar button").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      state.tab = btn.dataset.tab;
+      document.querySelectorAll("#tabbar button").forEach(function (b) {
+        b.classList.toggle("active", b === btn);
+      });
+      renderTab();
+    });
+  });
+
+  // Event delegation on #root: filter <select> changes and clicks (sortable
+  // headers, row expand/collapse) are both handled here instead of
+  // re-attaching listeners after every innerHTML rebuild.
+  document.getElementById("root").addEventListener("change", function (e) {
+    var el = e.target;
+    if (el.tagName !== "SELECT" || !el.dataset.filter) return;
+    var filters = state.tab === "monitoring" ? state.monFilters : state.accFilters;
+    filters[el.dataset.filter] = el.value;
+    if (state.tab === "monitoring") state.monExpanded = null; else state.accExpanded = null;
+    renderTab();
+  });
+
+  document.getElementById("root").addEventListener("click", function (e) {
+    var th = e.target.closest("th[data-sort-col]");
+    if (th) {
+      var sortState = state.tab === "monitoring" ? state.monSort : state.accSort;
+      var col = th.dataset.sortCol;
+      if (sortState.col === col) sortState.dir = sortState.dir === "asc" ? "desc" : "asc";
+      else { sortState.col = col; sortState.dir = "asc"; }
+      if (state.tab === "monitoring") state.monExpanded = null; else state.accExpanded = null;
+      renderTab();
+      return;
+    }
+    var row = e.target.closest("tr[data-row-idx]");
+    if (row) {
+      var idx = Number(row.dataset.rowIdx);
+      if (state.tab === "monitoring") state.monExpanded = state.monExpanded === idx ? null : idx;
+      else state.accExpanded = state.accExpanded === idx ? null : idx;
+      renderTab();
+    }
+  });
+
   function render(data) {
     showError("");
+    state.data = data;
     document.getElementById("updated-at").textContent =
       "Live from Google Sheets · " + (data.overview.monitoring_row_count + data.overview.accounting_row_count) + " rows";
-
-    var root = document.getElementById("root");
-    root.classList.remove("loading");
-    root.innerHTML =
-      renderOverview(data.overview) +
-      '<div class="grid2">' +
-      "<div><h2>Monitoring</h2>" + renderMonitoring(data.monitoring) + "</div>" +
-      "<div><h2>Accounting</h2>" + renderAccounting(data.accounting) + "</div>" +
-      "</div>" +
-      '<div class="card"><h2>Needs Attention</h2>' + renderNeedsAttention(data.needs_attention) + "</div>" +
-      '<div class="card"><h2>Recent Activity</h2>' + renderRecentActivity(data.recent_activity) + "</div>";
+    document.getElementById("root").classList.remove("loading");
+    renderTab();
   }
 
   initialize();

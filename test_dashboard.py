@@ -24,6 +24,26 @@ Covers three layers:
 
 Never writes to Sheets - this is a read-only feature, so there is nothing
 to clean up afterward and no synthetic-date/run_id tagging is needed.
+
+Dates: every Date cell is DD.MM.YYYY (e.g. "03.09.2026"), never ISO -
+Test 20 specifically checks that date-based sorting/max (trend order,
+"most recent" cash position, recent-activity order) is truly chronological
+rather than a lexicographic string sort, which is NOT the same thing for
+DD.MM.YYYY (e.g. "03.01.2027" < "28.12.2026" as plain strings, backwards).
+
+Interactive dashboard (Tests 21-25): dashboard_app.html now renders as
+three tabs (Overview/Monitoring/Accounting) with client-side filtering,
+sortable columns, and click-to-inspect row detail, all driven purely from
+the structuredContent this file's build_dashboard() already computes - no
+new Sheets access pattern, no server-side filtering endpoint, no second
+data store. Tests 21-23 check the new server-side fields those features
+read (full, never-truncated "records" lists, "pending_items",
+"resolved_count", "by_status"); Test 24 checks the HTML source for the new
+structural/empty-state pieces. The actual interactive DOM behavior (tab
+switching, filter/sort/click, both with an empty and a populated dataset)
+was additionally verified with a one-off jsdom-based render harness run
+outside this suite (jsdom is not a project dependency and is not required
+to run these tests).
 """
 
 import asyncio
@@ -40,26 +60,26 @@ ACC_HEADER = ACCOUNTING_HEADERS
 # issues, an Action Taken, and a Next Action - enough to exercise every
 # computed field in _build_monitoring without needing live Sheets access.
 SYNTHETIC_MONITORING = [MON_HEADER] + [
-    ["2026-09-01", "Site A", "Inverter outage", "Outage", "Critical", "Open", "3", "", "Priority escalation", ""],
-    ["2026-09-01", "Site B", "Optimizer failure", "Optimizer", "High", "Open", "1", "", "", "Vendor X"],
-    ["2026-09-02", "Site A", "Inverter outage", "Outage", "Critical", "Resolved", "4", "Replaced inverter", "", ""],
-    ["2026-09-02", "Site C", "Not reporting", "Monitoring", "", "Unconfirmed", "", "", "", ""],
-    ["2026-09-02", "Site D", "Minor GST mismatch", "Vendor", "Low", "Open", "", "", "Verify details", ""],
+    ["01.09.2026", "Site A", "Inverter outage", "Outage", "Critical", "Open", "3", "", "Priority escalation", ""],
+    ["01.09.2026", "Site B", "Optimizer failure", "Optimizer", "High", "Open", "1", "", "", "Vendor X"],
+    ["02.09.2026", "Site A", "Inverter outage", "Outage", "Critical", "Resolved", "4", "Replaced inverter", "", ""],
+    ["02.09.2026", "Site C", "Not reporting", "Monitoring", "", "Unconfirmed", "", "", "", ""],
+    ["02.09.2026", "Site D", "Minor GST mismatch", "Vendor", "Low", "Open", "", "", "Verify details", ""],
 ]
 
 # A small representative synthetic Accounting dataset covering Cash (two
 # dates, to prove "most recent date only"), Sale, Purchase, an Exception,
 # and a Tax row with a Risk/Tax Flag.
 SYNTHETIC_ACCOUNTING = [ACC_HEADER] + [
-    ["2026-09-01", "Cash", "", "Opening balance", "100000", "", "", "", "", ""],
-    ["2026-09-01", "Cash", "", "Closing balance", "90000", "", "", "", "", ""],
-    ["2026-09-02", "Cash", "", "Opening balance", "90000", "", "", "", "", ""],
-    ["2026-09-02", "Cash", "", "Closing balance", "120000", "", "", "", "", ""],
-    ["2026-09-01", "Sale", "", "Invoices raised", "50000", "5", "", "", "", ""],
-    ["2026-09-01", "Sale", "", "Outstanding receivables (over 60 days)", "15000", "", "", "", "", ""],
-    ["2026-09-01", "Purchase", "", "Purchase bills booked", "20000", "2", "", "", "", ""],
-    ["2026-09-01", "Exception", "ABC Traders", "GST mismatch", "12000", "", "Critical", "Open", "Verify with vendor", "GST"],
-    ["2026-09-02", "Tax", "XYZ Ltd", "ITC discrepancy", "5000", "", "", "Unconfirmed", "Confirm with CA", "ITC"],
+    ["01.09.2026", "Cash", "", "Opening balance", "100000", "", "", "", "", ""],
+    ["01.09.2026", "Cash", "", "Closing balance", "90000", "", "", "", "", ""],
+    ["02.09.2026", "Cash", "", "Opening balance", "90000", "", "", "", "", ""],
+    ["02.09.2026", "Cash", "", "Closing balance", "120000", "", "", "", "", ""],
+    ["01.09.2026", "Sale", "", "Invoices raised", "50000", "5", "", "", "", ""],
+    ["01.09.2026", "Sale", "", "Outstanding receivables (over 60 days)", "15000", "", "", "", "", ""],
+    ["01.09.2026", "Purchase", "", "Purchase bills booked", "20000", "2", "", "", "", ""],
+    ["01.09.2026", "Exception", "ABC Traders", "GST mismatch", "12000", "", "Critical", "Open", "Verify with vendor", "GST"],
+    ["02.09.2026", "Tax", "XYZ Ltd", "ITC discrepancy", "5000", "", "", "Unconfirmed", "Confirm with CA", "ITC"],
 ]
 
 
@@ -86,7 +106,7 @@ if __name__ == "__main__":
     print("=== Test 4: sites needing attention sorted by priority rank, Resolved excluded ===")
     sites = m["sites_needing_attention"]
     site_names = [s["site"] for s in sites]
-    assert "Site A" in site_names  # the OPEN Site A row (2026-09-01), not the Resolved one
+    assert "Site A" in site_names  # the OPEN Site A row (01.09.2026), not the Resolved one
     assert site_names[0] == "Site A" and sites[0]["priority"] == "Critical", (
         "Critical priority must sort first"
     )
@@ -100,12 +120,12 @@ if __name__ == "__main__":
 
     print("=== Test 6: open-issues trend appears with 2+ distinct dates, in date order ===")
     trend = m["open_issues_trend"]
-    assert [t["date"] for t in trend] == ["2026-09-01", "2026-09-02"], trend
+    assert [t["date"] for t in trend] == ["01.09.2026", "02.09.2026"], trend
     print("OK\n")
 
     print("=== Test 7: a single-date dataset produces NO trend (would be misleading) ===")
     single_date_dashboard = build_dashboard(
-        [MON_HEADER, ["2026-09-01", "Site A", "Issue", "Outage", "Critical", "Open", "", "", "", ""]],
+        [MON_HEADER, ["01.09.2026", "Site A", "Issue", "Outage", "Critical", "Open", "", "", "", ""]],
         [ACC_HEADER],
     )
     assert single_date_dashboard["monitoring"]["open_issues_trend"] == [], (
@@ -126,7 +146,7 @@ if __name__ == "__main__":
 
     print("=== Test 9: Cash position reflects only the MOST RECENT date, not a cross-date sum ===")
     cash = a["cash_position"]
-    assert cash["as_of"] == "2026-09-02", cash
+    assert cash["as_of"] == "02.09.2026", cash
     assert cash["Opening balance"] == "90000" and cash["Closing balance"] == "120000", cash
     print("OK\n")
 
@@ -159,8 +179,8 @@ if __name__ == "__main__":
 
     print("=== Test 13: Recent Activity returns both sheets, most-recent-first ===")
     ra = dashboard["recent_activity"]
-    assert ra["monitoring"][0]["date"] == "2026-09-02"
-    assert ra["accounting"][0]["date"] == "2026-09-02"
+    assert ra["monitoring"][0]["date"] == "02.09.2026"
+    assert ra["accounting"][0]["date"] == "02.09.2026"
     print("OK\n")
 
     print("=== Test 14: an empty/header-only sheet produces zeroed sections, never fabricated data ===")
@@ -225,5 +245,90 @@ if __name__ == "__main__":
         f"{live_dashboard['overview']['accounting_row_count']} Accounting row(s) - "
         "computed without error and without writing anything back.\n"
     )
+
+    print("=== Test 20: date sorting is chronological (DD.MM.YYYY), not a lexicographic string sort ===")
+    # "03.01.2027" < "28.12.2026" as plain strings (wrong order) but
+    # 2027-01-03 is chronologically AFTER 2026-12-28 (right order) - this
+    # is exactly the case a naive string sort/max gets backwards.
+    year_boundary_monitoring = [MON_HEADER] + [
+        ["28.12.2026", "Site A", "Issue A", "Outage", "Critical", "Open", "1", "", "", ""],
+        ["03.01.2027", "Site B", "Issue B", "Outage", "Critical", "Open", "1", "", "", ""],
+    ]
+    year_boundary_accounting = [ACC_HEADER] + [
+        ["28.12.2026", "Cash", "", "Closing balance", "10000", "", "", "", "", ""],
+        ["03.01.2027", "Cash", "", "Closing balance", "99999", "", "", "", "", ""],
+    ]
+    yb_dashboard = build_dashboard(year_boundary_monitoring, year_boundary_accounting)
+    yb_trend = yb_dashboard["monitoring"]["open_issues_trend"]
+    assert [t["date"] for t in yb_trend] == ["28.12.2026", "03.01.2027"], (
+        f"Trend must be in true chronological order, got: {yb_trend}"
+    )
+    yb_cash = yb_dashboard["accounting"]["cash_position"]
+    assert yb_cash["as_of"] == "03.01.2027", (
+        f"Most-recent-date cash position must pick the chronologically latest date, got: {yb_cash}"
+    )
+    assert yb_cash["Closing balance"] == "99999", yb_cash
+    yb_recent = yb_dashboard["recent_activity"]["monitoring"]
+    assert yb_recent[0]["date"] == "03.01.2027", (
+        f"Recent Activity must list the chronologically latest date first, got: {yb_recent}"
+    )
+    print("OK: trend, cash 'as of' date, and Recent Activity all order by true chronology across a year boundary.\n")
+
+    print("=== Test 21: monitoring/accounting 'records' carry every row, in the shape the interactive UI reads ===")
+    assert len(m["records"]) == m["total_rows"] == 5, m["records"]
+    assert len(a["records"]) == a["total_rows"] == 9, a["records"]
+    rec0 = m["records"][0]
+    assert set(rec0) == {"date", "site", "issue", "category", "priority", "status", "days_open", "action_taken", "next_action", "vendor"}, rec0
+    arec0 = a["records"][0]
+    assert set(arec0) == {"date", "record_type", "entity", "description", "amount", "count", "priority", "status", "recommended_action", "risk_tax_flag"}, arec0
+    print("OK: 'records' present on both sections with plain lowercase keys covering every schema column.\n")
+
+    print("=== Test 22: 'records' is NEVER truncated, unlike the curated needs-attention/exception lists (limit=15) ===")
+    big_monitoring = [MON_HEADER] + [
+        ["01.09.2026", "Site " + str(i), "Issue " + str(i), "Outage", "Critical", "Open", "1", "", "", ""]
+        for i in range(20)
+    ]
+    big_accounting = [ACC_HEADER] + [
+        ["01.09.2026", "Exception", "Entity " + str(i), "Issue " + str(i), str(1000 + i), "", "Critical", "Open", "", "GST"]
+        for i in range(20)
+    ]
+    big_dashboard = build_dashboard(big_monitoring, big_accounting)
+    assert len(big_dashboard["monitoring"]["records"]) == 20, len(big_dashboard["monitoring"]["records"])
+    assert len(big_dashboard["monitoring"]["sites_needing_attention"]) == 15, "curated list must still be capped at 15"
+    assert len(big_dashboard["accounting"]["records"]) == 20, len(big_dashboard["accounting"]["records"])
+    assert len(big_dashboard["accounting"]["high_priority_exceptions"]) == 15, "curated list must still be capped at 15"
+    print("OK: 'records' returned all 20 rows in both sections while the curated lists stayed capped at 15.\n")
+
+    print("=== Test 23: resolved_count, by_status, and pending_items are computed correctly ===")
+    assert m["resolved_count"] == 1, m["resolved_count"]  # the one Resolved row out of 5
+    assert m["by_status"] == {"Open": 3, "Resolved": 1, "Unconfirmed": 1}, m["by_status"]
+    pending_dashboard = build_dashboard(
+        [MON_HEADER],
+        [ACC_HEADER] + [
+            ["01.09.2026", "Pending", "Vendor A", "Follow-up needed", "", "", "", "Pending", "", ""],
+            ["02.09.2026", "Pending", "", "Bank reconciliation pending", "", "", "", "Pending", "", ""],
+        ],
+    )
+    assert len(pending_dashboard["accounting"]["pending_items"]) == 2, pending_dashboard["accounting"]["pending_items"]
+    assert pending_dashboard["accounting"]["pending_items"][0]["date"] == "02.09.2026", (
+        "pending_items must be most-recent-first"
+    )
+    print("OK: resolved_count/by_status match the synthetic Monitoring set; pending_items lists every Pending row, newest first.\n")
+
+    print("=== Test 24: dashboard_app.html contains the new interactive structure and empty-state copy ===")
+    assert 'id="tabbar"' in html_text and 'data-tab="monitoring"' in html_text and 'data-tab="accounting"' in html_text, (
+        "Expected the Overview/Monitoring/Accounting tab bar in the HTML"
+    )
+    assert "No monitoring data available yet." in html_text, "Expected the exact required Monitoring empty-state message"
+    assert "No accounting data available yet." in html_text, "Expected the exact required Accounting empty-state message"
+    for hook in ("data-filter=", "data-sort-col=", "data-row-idx=", "detail-grid"):
+        assert hook in html_text, f"Expected filter/sort/detail-inspect hook {hook!r} in the HTML"
+    print("OK: tab bar, both required empty-state strings, and the filter/sort/detail-inspect hooks are all present.\n")
+
+    print("=== Test 25: an empty dashboard's 'records'/'pending_items' are empty lists, never omitted or fabricated ===")
+    assert empty_dashboard["monitoring"]["records"] == []
+    assert empty_dashboard["accounting"]["records"] == []
+    assert empty_dashboard["accounting"]["pending_items"] == []
+    print("OK\n")
 
     print("All dashboard tests passed.")

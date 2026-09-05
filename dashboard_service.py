@@ -52,6 +52,23 @@ def _priority_rank(priority: str) -> int:
     return _PRIORITY_RANK.get(priority, 4)
 
 
+def _date_sort_key(date_str: str) -> tuple[int, int, int]:
+    """Chronological sort key for a "DD.MM.YYYY" Date cell.
+
+    A plain string sort/max on DD.MM.YYYY is NOT chronological order (e.g.
+    "01.01.2027" < "31.12.2026" lexicographically, which is backwards) -
+    every date-based sort/max in this module must go through this instead
+    of comparing the raw strings directly. A blank or malformed date sorts
+    first (0, 0, 0) rather than raising, since a Sheets row is still valid
+    business data even if its Date cell is somehow unreadable.
+    """
+    try:
+        day, month, year = date_str.split(".")
+        return (int(year), int(month), int(day))
+    except (ValueError, AttributeError):
+        return (0, 0, 0)
+
+
 def _is_open(status: str) -> bool:
     return status.strip().lower() not in _RESOLVED_STATUSES if status else True
 
@@ -97,7 +114,7 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
             for r in open_records
             if r.get("Site")
         ),
-        key=lambda r: (_priority_rank(r["priority"]), r["date"]),
+        key=lambda r: (_priority_rank(r["priority"]), _date_sort_key(r["date"])),
     )[:_NEEDS_ATTENTION_LIMIT]
 
     recent_actions = sorted(
@@ -106,7 +123,7 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
             for r in records
             if r.get("Action Taken")
         ),
-        key=lambda r: r["date"],
+        key=lambda r: _date_sort_key(r["date"]),
         reverse=True,
     )[:_RECENT_LIMIT]
 
@@ -116,7 +133,7 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
             for r in records
             if r.get("Next Action")
         ),
-        key=lambda r: r["date"],
+        key=lambda r: _date_sort_key(r["date"]),
         reverse=True,
     )[:_RECENT_LIMIT]
 
@@ -125,21 +142,49 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
     # against, so it's omitted entirely rather than shown as a flat line.
     open_issues_by_date = Counter(r["Date"] for r in open_records if r.get("Date"))
     trend = (
-        [{"date": d, "open_issues": c} for d, c in sorted(open_issues_by_date.items())]
+        [
+            {"date": d, "open_issues": c}
+            for d, c in sorted(open_issues_by_date.items(), key=lambda item: _date_sort_key(item[0]))
+        ]
         if len(open_issues_by_date) > 1
         else []
     )
 
+    # The FULL row set (never limited/truncated, unlike the curated lists
+    # above) - this is what the interactive UI filters/sorts/inspects
+    # client-side. Still computed fresh from `records` on every call, and
+    # still nothing but what's actually in the sheet - just reshaped to
+    # plain lowercase keys matching MONITORING_HEADERS 1:1, so the client
+    # never needs its own copy of the schema to render a row.
+    all_records = [
+        {
+            "date": r.get("Date", ""),
+            "site": r.get("Site", ""),
+            "issue": r.get("Issue", ""),
+            "category": r.get("Category", ""),
+            "priority": r.get("Priority", ""),
+            "status": r.get("Status", ""),
+            "days_open": r.get("Days Open", ""),
+            "action_taken": r.get("Action Taken", ""),
+            "next_action": r.get("Next Action", ""),
+            "vendor": r.get("Vendor", ""),
+        }
+        for r in records
+    ]
+
     return {
         "total_rows": len(records),
         "total_open_issues": len(open_records),
+        "resolved_count": len(records) - len(open_records),
         "critical_high_count": len(critical_high),
         "by_category": dict(by_category.most_common()),
         "by_priority": dict(by_priority.most_common()),
+        "by_status": dict(Counter(r["Status"] for r in records if r.get("Status")).most_common()),
         "sites_needing_attention": sites_needing_attention,
         "recent_actions": recent_actions,
         "recent_next_actions": recent_next_actions,
         "open_issues_trend": trend,
+        "records": all_records,
     }
 
 
@@ -179,7 +224,7 @@ def _build_accounting(records: list[dict[str, str]]) -> dict[str, Any]:
     # summary was processed for - the dashboard shows only the MOST
     # RECENT date's position, not a sum across every date ever processed.
     cash_rows = [r for r in records if r.get("Record Type") == "Cash"]
-    latest_cash_date = max((r["Date"] for r in cash_rows if r.get("Date")), default="")
+    latest_cash_date = max((r["Date"] for r in cash_rows if r.get("Date")), key=_date_sort_key, default="")
     cash_position = {
         label: next(
             (r.get("Amount", "") for r in cash_rows if r.get("Date") == latest_cash_date and r.get("Description") == label),
@@ -216,12 +261,50 @@ def _build_accounting(records: list[dict[str, str]]) -> dict[str, Any]:
             for r in records
             if r.get("Record Type") == "Exception" and (r.get("Priority") in ("Critical", "High") or _is_open(r.get("Status", "")))
         ),
-        key=lambda r: (_priority_rank(r["priority"]), r["date"]),
+        key=lambda r: (_priority_rank(r["priority"]), _date_sort_key(r["date"])),
     )[:_NEEDS_ATTENTION_LIMIT]
+
+    # Pending From Yesterday rows, in full (not limited) - these are a
+    # named metric in their own right ("Pending items"), not just another
+    # Record Type count, so they get their own list the same way tax_flags
+    # and high_priority_exceptions do.
+    pending_items = sorted(
+        (
+            {
+                "date": r.get("Date", ""),
+                "entity": r.get("Entity", ""),
+                "description": r.get("Description", ""),
+                "status": r.get("Status", ""),
+            }
+            for r in records
+            if r.get("Record Type") == "Pending"
+        ),
+        key=lambda r: _date_sort_key(r["date"]),
+        reverse=True,
+    )
+
+    # The FULL row set (never limited/truncated) for client-side
+    # filter/sort/inspect - see the matching comment in _build_monitoring.
+    all_records = [
+        {
+            "date": r.get("Date", ""),
+            "record_type": r.get("Record Type", ""),
+            "entity": r.get("Entity", ""),
+            "description": r.get("Description", ""),
+            "amount": r.get("Amount", ""),
+            "count": r.get("Count", ""),
+            "priority": r.get("Priority", ""),
+            "status": r.get("Status", ""),
+            "recommended_action": r.get("Recommended Action", ""),
+            "risk_tax_flag": r.get("Risk / Tax Flag", ""),
+        }
+        for r in records
+    ]
 
     return {
         "total_rows": len(records),
         "by_record_type": dict(by_record_type.most_common()),
+        "by_status": dict(Counter(r["Status"] for r in records if r.get("Status")).most_common()),
         "amount_total_by_record_type": amount_total_by_type,
         "sales_total": sales_total,
         "purchase_total": amount_total_by_type.get("Purchase", 0),
@@ -229,6 +312,8 @@ def _build_accounting(records: list[dict[str, str]]) -> dict[str, Any]:
         "cash_position": cash_position,
         "tax_flags": tax_flags,
         "high_priority_exceptions": high_priority_exceptions,
+        "pending_items": pending_items,
+        "records": all_records,
     }
 
 
@@ -259,7 +344,7 @@ def _build_needs_attention(monitoring: list[dict[str, str]], accounting: list[di
             "priority": r.get("Priority", ""),
             "status": r.get("Status", ""),
         })
-    items.sort(key=lambda r: (_priority_rank(r["priority"]), r["date"]))
+    items.sort(key=lambda r: (_priority_rank(r["priority"]), _date_sort_key(r["date"])))
     return items[:_NEEDS_ATTENTION_LIMIT]
 
 
@@ -275,7 +360,7 @@ def _build_recent_activity(monitoring: list[dict[str, str]], accounting: list[di
             }
             for r in monitoring
         ),
-        key=lambda r: r["date"],
+        key=lambda r: _date_sort_key(r["date"]),
         reverse=True,
     )[:_RECENT_LIMIT]
 
@@ -290,7 +375,7 @@ def _build_recent_activity(monitoring: list[dict[str, str]], accounting: list[di
             }
             for r in accounting
         ),
-        key=lambda r: r["date"],
+        key=lambda r: _date_sort_key(r["date"]),
         reverse=True,
     )[:_RECENT_LIMIT]
 
