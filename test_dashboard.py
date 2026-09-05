@@ -45,6 +45,27 @@ was additionally verified with a one-off jsdom-based render harness run
 outside this suite (jsdom is not a project dependency and is not required
 to run these tests).
 
+Row-kind correctness (Tests 38-45): the Monitoring sheet has no Section/
+Type column - Needs Attention, Actions Taken, What's Needed Next, and
+Service Pattern Watch all write into the same 10 columns, and three of
+the four default their Status to "Open" (see summary_parser.
+build_monitoring_rows). A naive "Status != Resolved" count therefore
+blends real open issues together with already-performed actions and
+forward-looking requirements. dashboard_service._classify_monitoring_kind
+tells them apart using only fields already written deterministically per
+section (Status == "Monitoring" for Service Pattern Watch, a populated
+Action Taken for Actions Taken, Issue == Next Action for What's Needed
+Next) - Tests 38-41 reproduce the real bug report's exact shape (39 total
+rows, only 10 of them genuine issues) and check every angle of that
+distinction. Tests 42-43 check the has_accounting_data distinction (no
+rows vs. real computed zero) all the way through to both dashboard_app.
+html and mcp_server._dashboard_summary_lines. Tests 44-45 check
+_dashboard_summary_lines' date-honesty behavior directly - it's a pure
+function extracted from get_business_dashboard specifically so it's
+testable without a live MCP session (client_supports_apps needs a real
+ctx that a test can't construct); get_business_dashboard's actual
+behavior is unchanged, this is a pure refactor.
+
 Owner-level dashboard (Tests 26-37): "today" is always the most recent
 DATE ACTUALLY PRESENT in each sheet's own rows, never the server clock -
 _build_what_changed derives Monitoring's and Accounting's "today" dates
@@ -505,5 +526,102 @@ if __name__ == "__main__":
     assert far_past_dashboard["what_changed"]["monitoring_date"] == "15.03.2019"
     assert far_past_dashboard["what_changed"]["monitoring_date"] != _datetime.date.today().strftime("%d.%m.%Y")
     print("OK: 'today' is read from the sheet's own dates, confirmed against a date nowhere near the real current date.\n")
+
+    print("=== Test 38: mixed-section Monitoring reproduces the real bug report - 39 rows, only 10 genuine issues ===")
+    # Shaped exactly like the live sheet that triggered this fix: real
+    # Needs Attention issues, plus Actions Taken / What's Needed Next /
+    # Service Pattern Watch rows that must NOT inflate Open Issues.
+    mixed_monitoring = [MON_HEADER]
+    for i in range(10):
+        mixed_monitoring.append(["03.09.2026", f"Issue Site {i}", f"Outage {i}", "Outage", "", "Open", "", "", "", ""])
+    for i in range(19):
+        mixed_monitoring.append(["03.09.2026", f"Action Site {i}", f"Fix {i}", "Optimizer", "", "Open", "", f"replaced {i}", "", ""])
+    for i in range(5):
+        mixed_monitoring.append(["03.09.2026", "", f"Requirement {i}", "", "", "Open", "", "", f"Requirement {i}", ""])
+    for i in range(5):
+        mixed_monitoring.append(["03.09.2026", f"Pattern Site {i}", f"Pattern {i}", "Inverter", "", "Monitoring", "", "", "", ""])
+    assert len(mixed_monitoring) - 1 == 39, len(mixed_monitoring) - 1
+
+    mixed_dashboard = build_dashboard(mixed_monitoring, [ACC_HEADER])
+    mixed_m = mixed_dashboard["monitoring"]
+    assert mixed_m["total_rows"] == 39, mixed_m["total_rows"]
+    assert mixed_m["total_open_issues"] == 10, (
+        f"Expected only the 10 genuine Needs Attention rows to count as Open Issues, got {mixed_m['total_open_issues']}"
+    )
+    assert mixed_m["issue_records_count"] == 10, mixed_m["issue_records_count"]
+    print("OK: 39 total rows, but Open Issues correctly reports 10 - not 39.\n")
+
+    print("=== Test 39: Actions Taken rows are excluded from Open Issues/Sites Needing Attention ===")
+    assert mixed_m["actions_taken_count"] == 19, mixed_m["actions_taken_count"]
+    attention_sites = {s["site"] for s in mixed_m["sites_needing_attention"]}
+    assert not any(site.startswith("Action Site") for site in attention_sites), (
+        f"An Actions Taken row leaked into sites_needing_attention: {attention_sites}"
+    )
+    print("OK\n")
+
+    print("=== Test 40: What's Needed Next rows are excluded from Open Issues/Sites Needing Attention ===")
+    assert mixed_m["whats_needed_next_count"] == 5, mixed_m["whats_needed_next_count"]
+    assert not any(s["issue"].startswith("Requirement") for s in mixed_m["sites_needing_attention"]), (
+        "A What's Needed Next row leaked into sites_needing_attention"
+    )
+    print("OK\n")
+
+    print("=== Test 41: Service Pattern Watch rows are excluded from Open Issues/Sites Needing Attention ===")
+    assert mixed_m["service_pattern_watch_count"] == 5, mixed_m["service_pattern_watch_count"]
+    assert not any(site.startswith("Pattern Site") for site in attention_sites), (
+        f"A Service Pattern Watch row leaked into sites_needing_attention: {attention_sites}"
+    )
+    # Also check What Changed Today's "new_open_issues" (the same metric,
+    # computed independently in _build_what_changed) isn't inflated either.
+    assert mixed_dashboard["what_changed"]["new_open_issues"] == 10, mixed_dashboard["what_changed"]["new_open_issues"]
+    print("OK: all three non-issue section kinds are correctly excluded everywhere Open Issues is computed.\n")
+
+    print("=== Test 42: 'No Accounting data' is distinguished from a real computed ₹0, in build_dashboard() ===")
+    no_data_dashboard = build_dashboard([MON_HEADER], [ACC_HEADER])
+    assert no_data_dashboard["overview"]["has_accounting_data"] is False
+    assert no_data_dashboard["overview"]["sales_total"] == 0  # still a real, honestly-computed 0
+    real_zero_dashboard = build_dashboard(
+        [MON_HEADER],
+        [ACC_HEADER, ["03.09.2026", "Sale", "", "Invoices raised", "0", "0", "", "", "", ""]],
+    )
+    assert real_zero_dashboard["overview"]["has_accounting_data"] is True
+    assert real_zero_dashboard["overview"]["sales_total"] == 0
+    print("OK: both cases compute sales_total=0, but only has_accounting_data tells them apart.\n")
+
+    print("=== Test 43: the no-data-vs-zero distinction reaches dashboard_app.html and the text summary ===")
+    assert "has_accounting_data" in html_text, "dashboard_app.html must read the has_accounting_data flag"
+    assert "No accounting data available for this date." in html_text
+    no_acc_lines = srv._dashboard_summary_lines(no_data_dashboard, True, "03.09.2026")
+    assert "No accounting data available for this date." in no_acc_lines, no_acc_lines
+    assert not any("Sales Total: 0" in line or "₹0" in line for line in no_acc_lines), (
+        f"Must never print a bare 0/₹0 for Sales when there is no Accounting data at all: {no_acc_lines}"
+    )
+    real_zero_lines = srv._dashboard_summary_lines(real_zero_dashboard, True, "03.09.2026")
+    assert any("Sales Total: 0" in line for line in real_zero_lines), (
+        f"A real computed 0 (from an actual Sale row) must still be shown as 0: {real_zero_lines}"
+    )
+    print("OK: dashboard_app.html and the MCP text response both distinguish no-data from a real zero.\n")
+
+    print("=== Test 44: _dashboard_summary_lines exposes the actual report date, and flags an unavailable 'today' ===")
+    current_dashboard = build_dashboard(
+        [MON_HEADER, ["05.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
+        [ACC_HEADER],
+    )
+    current_lines = srv._dashboard_summary_lines(current_dashboard, True, "05.09.2026")
+    assert "Monitoring report date: 05.09.2026." in current_lines, current_lines
+
+    stale_dashboard = build_dashboard(
+        [MON_HEADER, ["03.09.2026", "Site A", "Outage", "Outage", "", "Open", "", "", "", ""]],
+        [ACC_HEADER],
+    )
+    stale_lines = srv._dashboard_summary_lines(stale_dashboard, True, "05.09.2026")
+    assert "Today's report (05.09.2026) is not available. Latest available report: 03.09.2026." in stale_lines, stale_lines
+    print("OK: the response states the real report date, and explicitly flags when it isn't today's.\n")
+
+    print("=== Test 45: no developer/debug language in the normal owner-facing response ===")
+    for banned in ("almost certainly", "doesn't look wired", "unverified", "test submissions", "test_connection", "unreliable"):
+        assert banned not in " ".join(current_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
+        assert banned not in " ".join(stale_lines).lower(), f"Found debug language {banned!r} in the owner-facing response"
+    print("OK: the response text is factual and free of developer/debug language.\n")
 
     print("All dashboard tests passed.")

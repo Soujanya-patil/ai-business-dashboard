@@ -98,12 +98,58 @@ def _round_amount(value: float) -> float | int:
 
 
 # --- Monitoring -------------------------------------------------------
+# The Monitoring sheet has no Section/Type column - all four summary
+# sections (Needs Attention, Actions Taken, What's Needed Next, Service
+# Pattern Watch) write into the same 10 columns, and three of the four
+# default their Status to "Open" (see summary_parser.build_monitoring_rows)
+# since there's no better signal at write time. That means a naive
+# "Status != Resolved" count blends real open issues together with
+# already-performed actions and forward-looking requirements that were
+# never themselves an "issue" - inflating Open Issues with rows that
+# aren't open issues at all.
+#
+# _classify_monitoring_kind infers which section a row came from using
+# ONLY fields build_monitoring_rows already writes deterministically per
+# section - no new column, nothing invented:
+#   - Status == "Monitoring" is Service Pattern Watch's unique default -
+#     no other section ever writes that value.
+#   - Action Taken is populated ONLY by the Actions Taken section.
+#   - Issue and Next Action holding the IDENTICAL shortened text happens
+#     ONLY in What's Needed Next (see build_monitoring_rows: `shortened`
+#     is written into both columns verbatim) - Needs Attention rows split
+#     the issue text and the action clause from different parts of the
+#     original sentence, so they don't coincide this way in practice.
+#   - Anything left is a genuine Needs Attention issue row.
+_KIND_SERVICE_PATTERN_WATCH = "service_pattern_watch"
+_KIND_ACTIONS_TAKEN = "actions_taken"
+_KIND_WHATS_NEEDED_NEXT = "whats_needed_next"
+_KIND_NEEDS_ATTENTION = "needs_attention"
+
+
+def _classify_monitoring_kind(r: dict[str, str]) -> str:
+    if r.get("Status") == "Monitoring":
+        return _KIND_SERVICE_PATTERN_WATCH
+    if r.get("Action Taken"):
+        return _KIND_ACTIONS_TAKEN
+    issue = r.get("Issue", "")
+    if issue and issue == r.get("Next Action", ""):
+        return _KIND_WHATS_NEEDED_NEXT
+    return _KIND_NEEDS_ATTENTION
+
+
 def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
     open_records = [r for r in records if _is_open(r.get("Status", ""))]
 
-    by_category = Counter(r["Category"] for r in open_records if r.get("Category"))
-    by_priority = Counter(r["Priority"] for r in open_records if r.get("Priority"))
-    critical_high = [r for r in open_records if r.get("Priority") in ("Critical", "High")]
+    # Open Issues / Critical-High / Priority / Category / Sites Needing
+    # Attention must only ever be computed from genuine issue rows - an
+    # Actions Taken or What's Needed Next row is real information (see the
+    # *_count fields below) but it is not itself an open issue.
+    issue_records = [r for r in records if _classify_monitoring_kind(r) == _KIND_NEEDS_ATTENTION]
+    open_issue_records = [r for r in issue_records if _is_open(r.get("Status", ""))]
+
+    by_category = Counter(r["Category"] for r in open_issue_records if r.get("Category"))
+    by_priority = Counter(r["Priority"] for r in open_issue_records if r.get("Priority"))
+    critical_high = [r for r in open_issue_records if r.get("Priority") in ("Critical", "High")]
 
     sites_needing_attention = sorted(
         (
@@ -116,7 +162,7 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
                 "status": r.get("Status", ""),
                 "days_open": r.get("Days Open", ""),
             }
-            for r in open_records
+            for r in open_issue_records
             if r.get("Site")
         ),
         key=lambda r: (_priority_rank(r["priority"]), _date_sort_key(r["date"])),
@@ -145,7 +191,9 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
     # A trend is only meaningful with more than one distinct reporting
     # date in the sheet - a single-date snapshot has nothing to trend
     # against, so it's omitted entirely rather than shown as a flat line.
-    open_issues_by_date = Counter(r["Date"] for r in open_records if r.get("Date"))
+    # Scoped to genuine issue rows, same as total_open_issues above - a
+    # trend labeled "open issues" must actually track open issues.
+    open_issues_by_date = Counter(r["Date"] for r in open_issue_records if r.get("Date"))
     trend = (
         [
             {"date": d, "open_issues": c}
@@ -179,7 +227,12 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
 
     return {
         "total_rows": len(records),
-        "total_open_issues": len(open_records),
+        # Genuine issue rows only (see _classify_monitoring_kind above) -
+        # this is what fixes "every Monitoring row counted as an open
+        # issue" regardless of whether it was actually an action taken or
+        # a forward-looking requirement.
+        "total_open_issues": len(open_issue_records),
+        "issue_records_count": len(issue_records),
         "resolved_count": len(records) - len(open_records),
         "critical_high_count": len(critical_high),
         "by_category": dict(by_category.most_common()),
@@ -190,6 +243,11 @@ def _build_monitoring(records: list[dict[str, str]]) -> dict[str, Any]:
         "recent_next_actions": recent_next_actions,
         "open_issues_trend": trend,
         "records": all_records,
+        # The other three sections, preserved as their own counts rather
+        # than folded into (or dropped from) the issue metrics above.
+        "actions_taken_count": sum(1 for r in records if _classify_monitoring_kind(r) == _KIND_ACTIONS_TAKEN),
+        "whats_needed_next_count": sum(1 for r in records if _classify_monitoring_kind(r) == _KIND_WHATS_NEEDED_NEXT),
+        "service_pattern_watch_count": sum(1 for r in records if _classify_monitoring_kind(r) == _KIND_SERVICE_PATTERN_WATCH),
     }
 
 
@@ -435,13 +493,21 @@ def _build_what_changed(monitoring: list[dict[str, str]], accounting: list[dict[
 
     if monitoring_date:
         today_mon = [r for r in monitoring if r.get("Date") == monitoring_date]
-        result["new_open_issues"] = sum(1 for r in today_mon if _is_open(r.get("Status", "")))
+        # Same genuine-issue scoping as _build_monitoring's total_open_
+        # issues - an Actions Taken or What's Needed Next row dated today
+        # is real activity, but it is not itself a "new open issue".
+        today_mon_issues = [r for r in today_mon if _classify_monitoring_kind(r) == _KIND_NEEDS_ATTENTION]
+        result["new_open_issues"] = sum(1 for r in today_mon_issues if _is_open(r.get("Status", "")))
+        # Resolved is deliberately NOT scoped to issue-kind rows only - an
+        # Actions Taken row can itself report a resolution (e.g. "issue
+        # resolved"), which is a real resolution event regardless of which
+        # section it was written from.
         result["resolved_issues"] = sum(1 for r in today_mon if r.get("Status", "").strip().lower() == "resolved")
-        # Only OPEN Critical/High rows count here - a Critical issue that
-        # was both reported and resolved the same day isn't something
+        # Only OPEN Critical/High ISSUE rows count here - a Critical issue
+        # that was both reported and resolved the same day isn't something
         # still needing attention today.
         result["new_critical_high"] = sum(
-            1 for r in today_mon if r.get("Priority") in ("Critical", "High") and _is_open(r.get("Status", ""))
+            1 for r in today_mon_issues if r.get("Priority") in ("Critical", "High") and _is_open(r.get("Status", ""))
         )
 
     if accounting_date:
@@ -692,6 +758,11 @@ def build_dashboard(monitoring_rows: list[list[str]], accounting_rows: list[list
         # count _build_what_changed already computed, just also promoted
         # to the top-level KPI strip.
         "resolved_today": what_changed.get("resolved_issues"),
+        # Whether Accounting has ANY rows at all - the only reliable way to
+        # tell "genuine zero sales/purchases" apart from "no Day Book
+        # Summary has been processed yet", since a sum over zero rows and
+        # a sum of real zero-value rows both come out to the same 0.
+        "has_accounting_data": accounting_section["total_rows"] > 0,
         "accounting_exceptions": accounting_section["by_record_type"].get("Exception", 0),
         "sales_total": accounting_section["sales_total"],
         "purchase_total": accounting_section["purchase_total"],

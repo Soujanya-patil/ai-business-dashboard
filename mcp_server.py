@@ -1,4 +1,5 @@
 import os
+from datetime import date
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
@@ -122,6 +123,67 @@ service = build(
 # the top of the file, after `service`/SPREADSHEET_ID/MONITORING_TAB/
 # ACCOUNTING_TAB exist for this tool's body to use.
 
+def _dashboard_summary_lines(dashboard: dict, apps_supported: bool, today_str: str) -> list:
+    """Builds get_business_dashboard's plain-text response as a pure
+    function of already-computed data (no Sheets access, no ctx) - kept
+    separate from the tool function itself purely so this text-composition
+    logic can be unit tested directly; get_business_dashboard needs a
+    live MCP request context (for client_supports_apps) that a test can't
+    construct, but this function needs neither ctx nor a live session.
+
+    `today_str` is the ONE deliberate, narrow use of the server clock
+    anywhere in this project - purely to detect and disclose staleness
+    (never to label, write, or stand in for a row's actual date, which
+    always comes from the summary itself). Every row/date shown below
+    still comes straight from the sheet; this comparison only decides
+    whether to say so plainly when someone asks for "today's" report and
+    the latest available one is from an earlier day.
+    """
+    overview = dashboard["overview"]
+    what_changed = dashboard["what_changed"]
+    monitoring_date = what_changed.get("monitoring_date") or ""
+    accounting_date = what_changed.get("accounting_date") or ""
+
+    summary_lines = ["AI Business Dashboard (live from Google Sheets):"]
+
+    if not monitoring_date:
+        summary_lines.append("Monitoring: no reports on record yet.")
+    elif monitoring_date != today_str:
+        summary_lines.append(f"Today's report ({today_str}) is not available. Latest available report: {monitoring_date}.")
+    else:
+        summary_lines.append(f"Monitoring report date: {monitoring_date}.")
+
+    if accounting_date and accounting_date != today_str:
+        summary_lines.append(f"Latest Accounting report: {accounting_date}.")
+    elif accounting_date:
+        summary_lines.append(f"Accounting report date: {accounting_date}.")
+
+    summary_lines.append(f"Open Issues: {overview['total_open_issues']} (Critical/High: {overview['critical_high_issues']})")
+    summary_lines.append(f"Needs Attention: {overview['needs_attention_count']}")
+
+    if overview.get("has_accounting_data"):
+        summary_lines.append(f"Accounting Exceptions: {overview['accounting_exceptions']}")
+        summary_lines.append(f"Sales Total: {overview['sales_total']} | Purchase Total: {overview['purchase_total']}")
+        if overview.get("outstanding_receivables_total"):
+            summary_lines.append(f"Outstanding Receivables: {overview['outstanding_receivables_total']}")
+        cash_position = overview.get("cash_position") or {}
+        if cash_position.get("as_of"):
+            closing = cash_position.get("Closing balance") or "n/a"
+            summary_lines.append(f"Cash Position (as of {cash_position['as_of']}): Closing balance {closing}")
+    else:
+        # Never a bare "₹0" here - a sum over zero rows and a sum of real
+        # zero-value rows both come out to 0, and only this explicit line
+        # tells them apart.
+        summary_lines.append("No accounting data available for this date.")
+
+    if not apps_supported:
+        summary_lines.append(
+            "(This client does not support the MCP Apps interactive UI - showing computed totals only.)"
+        )
+
+    return summary_lines
+
+
 @apps.tool(resource_uri="ui://dashboard/app.html", visibility=["model", "app"])
 def get_business_dashboard(ctx: Context) -> CallToolResult:
     """Compute and show the owner/executive-level AI Business Dashboard -
@@ -157,29 +219,23 @@ def get_business_dashboard(ctx: Context) -> CallToolResult:
     dashboard inline in the chat, with its own Refresh button that re-
     calls this tool for live data; on any other client it returns the
     same computed totals as a concise text summary instead.
+
+    The text summary always states the actual Monitoring/Accounting
+    report date(s) it's reporting on, and explicitly says so - "Today's
+    report (DD.MM.YYYY) is not available. Latest available report:
+    DD.MM.YYYY." - when the server's calendar date doesn't match the most
+    recent date on record, rather than silently presenting older data as
+    if it were current. It also never prints a bare "0" for Sales/
+    Purchases when Accounting simply has no rows yet - see "No accounting
+    data available for this date." vs. a real computed 0.
     """
     monitoring_rows = get_tab_values(service, SPREADSHEET_ID, MONITORING_TAB)
     accounting_rows = get_tab_values(service, SPREADSHEET_ID, ACCOUNTING_TAB)
     dashboard = build_dashboard(monitoring_rows, accounting_rows)
 
-    overview = dashboard["overview"]
-    summary_lines = [
-        "AI Business Dashboard (live from Google Sheets):",
-        f"Open Issues: {overview['total_open_issues']} (Critical/High: {overview['critical_high_issues']})",
-        f"Needs Attention: {overview['needs_attention_count']}",
-        f"Accounting Exceptions: {overview['accounting_exceptions']}",
-        f"Sales Total: {overview['sales_total']} | Purchase Total: {overview['purchase_total']}",
-    ]
-    if overview.get("outstanding_receivables_total"):
-        summary_lines.append(f"Outstanding Receivables: {overview['outstanding_receivables_total']}")
-    cash_position = overview.get("cash_position") or {}
-    if cash_position.get("as_of"):
-        closing = cash_position.get("Closing balance") or "n/a"
-        summary_lines.append(f"Cash Position (as of {cash_position['as_of']}): Closing balance {closing}")
-    if not client_supports_apps(ctx):
-        summary_lines.append(
-            "(This client does not support the MCP Apps interactive UI - showing computed totals only.)"
-        )
+    summary_lines = _dashboard_summary_lines(
+        dashboard, client_supports_apps(ctx), date.today().strftime("%d.%m.%Y")
+    )
 
     return CallToolResult(
         content=[TextContent(type="text", text="\n".join(summary_lines))],

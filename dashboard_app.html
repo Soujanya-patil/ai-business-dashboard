@@ -377,20 +377,29 @@
   function renderOverview(o) {
     var cash = o.cash_position || {};
     var cashClosing = cash["Closing balance"];
-    return (
+    // has_accounting_data distinguishes "Accounting has no rows yet" from
+    // "Accounting has rows and they genuinely sum to zero" - a sum over
+    // zero rows and a sum of real zero-value rows both come out to 0, so
+    // only this flag (computed server-side from actual row counts) can
+    // tell them apart. Never show a bare ₹0 for the former.
+    var hasAccounting = !!o.has_accounting_data;
+    var html =
       '<div class="kpis">' +
       kpi(o.total_open_issues, "Open Issues") +
       kpi(o.critical_high_issues, "Critical / High") +
       (isKnown(o.resolved_today) ? kpi(o.resolved_today, "Resolved Today") : "") +
       kpi(o.needs_attention_count, "Total Attention Items") +
-      kpi(o.accounting_exceptions, "Accounting Exceptions") +
-      kpi(fmtAmount(o.sales_total), "Sales") +
-      kpi(fmtAmount(o.purchase_total), "Purchases") +
-      (isKnown(o.payments_total) ? kpi(fmtAmount(o.payments_total), "Payments") : "") +
-      (o.outstanding_receivables_total ? kpi(fmtAmount(o.outstanding_receivables_total), "Outstanding Receivables") : "") +
-      (cashClosing ? kpi(fmtAmount(cashClosing), "Cash Balance (" + esc(cash.as_of || "") + ")") : "") +
-      "</div>"
-    );
+      (hasAccounting ? kpi(o.accounting_exceptions, "Accounting Exceptions") : "") +
+      (hasAccounting ? kpi(fmtAmount(o.sales_total), "Sales") : "") +
+      (hasAccounting ? kpi(fmtAmount(o.purchase_total), "Purchases") : "") +
+      (hasAccounting && isKnown(o.payments_total) ? kpi(fmtAmount(o.payments_total), "Payments") : "") +
+      (hasAccounting && o.outstanding_receivables_total ? kpi(fmtAmount(o.outstanding_receivables_total), "Outstanding Receivables") : "") +
+      (hasAccounting && cashClosing ? kpi(fmtAmount(cashClosing), "Cash Balance (" + esc(cash.as_of || "") + ")") : "") +
+      "</div>";
+    if (!hasAccounting) {
+      html += '<div class="empty" style="margin-top:-6px;">No accounting data available for this date.</div>';
+    }
+    return html;
   }
 
   function sparkline(points) {
